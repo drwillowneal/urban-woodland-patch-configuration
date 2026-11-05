@@ -1,0 +1,609 @@
+---
+title: "01b Name and check the urban regions"
+output: html_notebook
+editor_options:
+  chunk_output_type: console
+---
+
+Names and checks the urban regions built by `01a_Prepare_BUA_Groups.Rmd`
+(read from `urban_region_checkpoints/`) and clips the National Forest
+Inventory (NFI) woodland data to them. Re-run `01a` first if the input
+data or a parameter changes.
+
+```{r setup}
+source(here::here("scripts", "00_setup.R"))
+```
+
+# Prepare BUA data (filter to England, join population)
+
+Needed here as well as in `01a` because naming looks up each constituent
+BUA's name and area from `bua`.
+
+```{r prepare_bua_data}
+# Filter to England using the LSOA-to-Region lookup rather than the
+# census population table. LSOAs cover the whole country without gaps,
+# whereas the census table's BUA22 codes do not match for central London,
+# so a semi_join against it would drop inner London from `bua`.
+england_buas <- lsoa_lookup |>
+  filter(startsWith(RGN22CD, "E12")) |>
+  distinct(BUA22CD)
+
+bua <- bua |>
+  semi_join(england_buas, by = "BUA22CD")
+
+# Add population counts and names. A left_join keeps any BUA missing from
+# the census population table, with population = NA.
+bua <- bua |>
+  left_join(
+    census |>
+      select(
+        BUA22CD = `BUA code`,
+        population = Counts,
+        size_classification = `BUA size classification`
+      ),
+    by = "BUA22CD"
+  )
+```
+
+# Name urban regions
+
+Reads `urban_region_checkpoints/07_urban_regions_final.rds` (saved by
+`01a_Prepare_BUA_Groups.Rmd`) and adds a name column, using `bua` (from
+the chunk above) to look up each constituent BUA's name and area.
+
+Limitation: for polycentric conurbations with no dominant BUA (for
+example Blackwater Valley), the largest constituent may not be the
+recognisable name for the group. A manual override table (below) handles
+known cases.
+
+Each group's constituent BUAs are found by matching geometry directly
+(`st_equals`) rather than by reconstructing `bua_row_id` with
+`row_number()`, which is not stable across separate runs.
+`bua_grouped_raw`'s geometry is an exact, untransformed copy of each
+constituent's original shape (01a Step 3B, before any buffering), so it
+matches `bua` regardless of row order.
+
+```{r name_urban_regions}
+library(sf)
+library(dplyr)
+
+bua_grouped_raw <- readRDS(
+  file.path(checkpoint_dir, "03c_bua_grouped_raw.rds")
+)
+
+urban_regions_final <- readRDS(
+  file.path(checkpoint_dir, "07_urban_regions_final.rds")
+)
+
+bua_matched <- st_join(
+  bua_grouped_raw,
+  bua |> select(BUA22CD, BUA22NM),
+  join = st_equals
+) |>
+  mutate(bua_area_m2 = as.numeric(st_area(geometry))) |>
+  st_drop_geometry()
+
+n_unmatched <- sum(is.na(bua_matched$BUA22NM))
+if (n_unmatched > 0) {
+  cat(
+    "WARNING:", n_unmatched, "of", nrow(bua_matched), "constituent BUAs",
+    "had no exact geometry match in `bua` — check that `bua` in this",
+    "session matches what 01a used to build the checkpoints.\n\n"
+  )
+}
+
+# Naming rule, applied identically to every region. If one constituent
+# BUA holds at least half of the group's total constituent area, the
+# region is named after that BUA alone. Otherwise no single BUA
+# dominates, and the region is named after its two largest constituents
+# ("X & Y"). Ties on BUA area are broken arbitrarily.
+region_names <- bua_matched |>
+  group_by(closing_group) |>
+  arrange(desc(bua_area_m2), .by_group = TRUE) |>
+  summarise(
+    total_constituent_area_m2 = sum(bua_area_m2),
+    largest_bua_area_m2 = dplyr::first(bua_area_m2),
+    largest_bua_name = dplyr::first(BUA22NM),
+    second_bua_name = if (dplyr::n() >= 2) dplyr::nth(BUA22NM, 2) else NA_character_,
+    .groups = "drop"
+  ) |>
+  mutate(
+    dominance_ratio = largest_bua_area_m2 / total_constituent_area_m2,
+    bua_name = if_else(
+      dominance_ratio >= 0.5 | is.na(second_bua_name),
+      largest_bua_name,
+      paste(largest_bua_name, "&", second_bua_name)
+    )
+  ) |>
+  select(closing_group, bua_name, largest_bua_area_m2, dominance_ratio)
+
+urban_regions_named <- urban_regions_final |>
+  left_join(region_names, by = "closing_group") |>
+  relocate(bua_name, .after = urban_region_id)
+
+cat("Regions with a name assigned:", sum(!is.na(urban_regions_named$bua_name)), "/", nrow(urban_regions_named), "\n")
+
+# Some groups remain split into several disjoint pieces after Step 7
+# (London, for example, has a main piece and a separate satellite).
+# Dissolve each group back into one (possibly multipart) feature before
+# filtering, so a small satellite merges into its parent city rather than
+# being judged against the sliver threshold on its own.
+n_rows_before_dissolve <- nrow(urban_regions_named)
+
+urban_regions_named <- urban_regions_named |>
+  group_by(closing_group, bua_name, bua_count) |>
+  summarise(
+    area_ha = sum(area_ha),
+    geometry = st_union(geometry),
+    .groups = "drop"
+  )
+
+cat(
+  "Dissolved", n_rows_before_dissolve, "pieces into",
+  nrow(urban_regions_named), "regions (one per closing_group)\n"
+)
+
+# Drop groups that are still negligible after dissolving. This is a
+# group-level total, so it removes only trivial groups (slivers and
+# near-empty artefacts), not small satellite parts of a larger city.
+min_area_ha <- 1
+
+n_before_area_filter <- nrow(urban_regions_named)
+
+urban_regions_named <- urban_regions_named |>
+  filter(area_ha >= min_area_ha)
+
+cat(
+  "Dropped", n_before_area_filter - nrow(urban_regions_named),
+  "regions below", min_area_ha, "ha (kept", nrow(urban_regions_named), ")\n"
+)
+
+# Name overrides for collective names where even the
+# two-largest-constituents rule reads badly. The table currently holds one
+# case, Blackwater Valley, a ten-town group that the rule would name after
+# its two largest towns. Read from region_name_overrides.csv (see
+# 00_setup.R) and matched by each group's set of constituent BUAs rather
+# than by closing_group id, which is not stable across re-runs. Rows are
+# added by hand.
+constituent_keys <- bua_matched |>
+  group_by(closing_group) |>
+  summarise(
+    constituent_key = paste(sort(unique(BUA22NM)), collapse = ";"),
+    .groups = "drop"
+  )
+
+name_override_lookup <- read.csv(
+  region_name_overrides_file,
+  stringsAsFactors = FALSE
+) |>
+  rename(constituent_key = constituent_buas, override_name = collective_name)
+
+override_by_group <- constituent_keys |>
+  left_join(name_override_lookup, by = "constituent_key") |>
+  select(closing_group, override_name)
+
+cat(
+  "Regions matched to a name override:",
+  sum(!is.na(override_by_group$override_name)), "\n"
+)
+
+urban_regions_named <- urban_regions_named |>
+  left_join(override_by_group, by = "closing_group") |>
+  mutate(bua_name = if_else(!is.na(override_name), override_name, bua_name)) |>
+  select(-override_name)
+
+# Recompute urban_region_id, since dissolving and filtering changed the
+# row count and order.
+urban_regions_named <- urban_regions_named |>
+  arrange(desc(area_ha)) |>
+  mutate(urban_region_id = row_number()) |>
+  relocate(urban_region_id, bua_name, closing_group, bua_count, area_ha, geometry)
+
+saveRDS(
+  urban_regions_named,
+  file.path(checkpoint_dir, "07b_urban_regions_named.rds")
+)
+
+st_write(
+  urban_regions_named,
+  file.path(checkpoint_dir, "urban_regions_named.gpkg"),
+  layer = "urban_regions",
+  delete_layer = TRUE,
+  quiet = TRUE
+)
+
+# Sorted by area to check the largest regions and their names.
+urban_regions_named |>
+  st_drop_geometry() |>
+  arrange(desc(area_ha)) |>
+  select(urban_region_id, bua_name, bua_count, area_ha) |>
+  head(20) |>
+  print()
+```
+
+# Labelled map (identify regions by name instead of guessing)
+
+Run after the naming chunk (`urban_regions_named` must exist). Labels
+only the largest N regions, because labelling all of them would be
+unreadable.
+
+```{r labelled_map}
+top_n_labels <- 40
+
+label_regions <- urban_regions_named |>
+  arrange(desc(area_ha)) |>
+  slice_head(n = top_n_labels)
+
+label_coords <- st_coordinates(st_centroid(st_geometry(label_regions)))
+
+plot(
+  st_geometry(urban_regions_named),
+  col = "grey70",
+  border = "black",
+  main = paste(
+    nrow(urban_regions_named),
+    "derived urban regions (top",
+    top_n_labels,
+    "labelled)"
+  )
+)
+
+text(
+  label_coords[, 1],
+  label_coords[, 2],
+  labels = label_regions$bua_name,
+  cex = 0.6,
+  col = "red",
+  font = 2
+)
+```
+
+# QA checks
+
+Sanity checks on `urban_regions_named`. Run after the naming chunk.
+
+```{r qa_checks}
+cat("=== BASIC SUMMARY ===\n")
+cat("Total regions:", nrow(urban_regions_named), "\n")
+cat("Total area (ha):", round(sum(urban_regions_named$area_ha), 1), "\n")
+cat("Regions with no name assigned:", sum(is.na(urban_regions_named$bua_name)), "\n")
+
+cat("\n=== AREA DISTRIBUTION (ha) ===\n")
+print(summary(urban_regions_named$area_ha))
+
+# Slivers: small leftover fragments from the Step 7 split are expected in
+# small numbers; a large count would suggest over-fragmentation.
+cat("\n=== SLIVER REGIONS (<1 ha) ===\n")
+cat("Count:", sum(urban_regions_named$area_ha < 1), "\n")
+cat(
+  "Combined area of all slivers (ha):",
+  round(sum(urban_regions_named$area_ha[urban_regions_named$area_ha < 1]), 2),
+  "\n"
+)
+
+# Groups that split into several regions. Pieces from the same original
+# group share a name and bua_count, because those are properties of the
+# group rather than of the fragment; keep this in mind when interpreting
+# bua_count.
+cat("\n=== GROUPS SPLIT INTO MULTIPLE REGIONS ===\n")
+split_groups <- urban_regions_named |>
+  st_drop_geometry() |>
+  count(closing_group, name = "n_pieces") |>
+  filter(n_pieces > 1)
+
+cat("Number of original groups that split into >1 region:", nrow(split_groups), "\n")
+cat("Largest split (most pieces from one group):", max(split_groups$n_pieces), "\n")
+
+cat("\nThe 15 groups that split into the most pieces:\n")
+urban_regions_named |>
+  st_drop_geometry() |>
+  semi_join(slice_max(split_groups, n_pieces, n = 15), by = "closing_group") |>
+  group_by(closing_group, bua_name) |>
+  summarise(
+    n_pieces = n(),
+    total_area_ha = sum(area_ha),
+    largest_piece_ha = max(area_ha),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_pieces)) |>
+  print(n = 15)
+
+# Naming check for groups with several pieces. bua_name belongs to the
+# whole closing_group, so the largest piece always carries it. This
+# instead flags groups whose bua_count is high relative to the named
+# BUA's own area, meaning many small BUAs were merged under one possibly
+# unrepresentative name.
+cat("\n=== POSSIBLE POLYCENTRIC NAMING MISMATCHES ===\n")
+cat("(high bua_count relative to region size can indicate a merged\n")
+cat("conurbation named after a non-dominant constituent, like Blackwater Valley)\n\n")
+
+urban_regions_named |>
+  st_drop_geometry() |>
+  group_by(closing_group, bua_name) |>
+  summarise(total_area_ha = sum(area_ha), bua_count = first(bua_count), .groups = "drop") |>
+  mutate(ha_per_bua = total_area_ha / bua_count) |>
+  arrange(ha_per_bua) |>
+  filter(bua_count >= 10) |>
+  head(15) |>
+  print()
+
+cat("\n=== TOP 20 REGIONS BY AREA (post-fix) ===\n")
+urban_regions_named |>
+  st_drop_geometry() |>
+  arrange(desc(area_ha)) |>
+  select(urban_region_id, bua_name, closing_group, bua_count, area_ha) |>
+  head(20) |>
+  print()
+```
+
+# National map (publication quality)
+
+Requires `ggrepel`.
+
+Design choices: sequential viridis fill on a log scale, because region
+area is strongly right-skewed and a linear scale would show no variation
+among smaller cities; viridis is perceptually uniform and colourblind
+safe. Polygon borders are omitted because with over 3,000 regions they
+read as noise at national scale. The 20 largest regions are labelled
+using ggrepel, so labels do not overlap.
+
+```{r national_map}
+library(ggplot2)
+library(ggrepel)
+library(scales)
+
+top_n_labels <- 20
+
+label_regions <- urban_regions_named |>
+  arrange(desc(area_ha)) |>
+  slice_head(n = top_n_labels)
+
+label_coords <- st_centroid(st_geometry(label_regions)) |>
+  st_coordinates() |>
+  as.data.frame()
+
+label_regions <- bind_cols(
+  st_drop_geometry(label_regions),
+  label_coords
+)
+
+national_map <- ggplot(urban_regions_named) +
+  geom_sf(aes(fill = area_ha), colour = NA) +
+  geom_text_repel(
+    data = label_regions,
+    aes(X, Y, label = bua_name),
+    size = 3,
+    fontface = "bold",
+    colour = "grey15",
+    bg.color = "white",
+    bg.r = 0.15,
+    max.overlaps = Inf,
+    seed = 1
+  ) +
+  scale_fill_viridis_c(
+    name = "Area (ha)",
+    trans = "log10",
+    labels = label_comma()
+  ) +
+  labs(
+    title = "Derived urban regions of England",
+    subtitle = paste0(
+      nrow(urban_regions_named),
+      " regions, from ONS Built-Up Areas 2022 (BUA22)"
+    ),
+    caption = "Boundaries derived via morphological closing of BUA22 polygons"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+    plot.caption = element_text(colour = "grey50", size = 8),
+    legend.position = "right"
+  )
+
+national_map
+
+ggsave(
+  file.path(checkpoint_dir, "national_map.png"),
+  national_map,
+  width = 10,
+  height = 12,
+  dpi = 300
+)
+
+cat("Saved to:", file.path(checkpoint_dir, "national_map.png"), "\n")
+```
+
+# Export AOI boundary for EDINA Digimap
+
+Produces a single dissolved boundary covering all urban regions, for
+uploading to EDINA Digimap's AOI tool so that the OS MasterMap Natural
+Environment download is limited to where the urban regions are. The
+boundary only sets a download extent and is not used in any analysis, so
+it is lightly simplified to keep the upload file small.
+
+```{r export_digimap_aoi}
+library(sf)
+
+aoi_dir <- file.path(checkpoint_dir, "digimap_aoi")
+
+dir.create(aoi_dir, showWarnings = FALSE, recursive = TRUE)
+
+aoi_geom <- urban_regions_named |>
+  st_geometry() |>
+  st_union() |>
+  st_simplify(dTolerance = 10, preserveTopology = TRUE)
+
+aoi_boundary <- st_sf(
+  name = "urban_regions_aoi",
+  geometry = aoi_geom
+)
+
+st_write(
+  aoi_boundary,
+  file.path(aoi_dir, "urban_regions_aoi.shp"),
+  delete_layer = TRUE,
+  quiet = TRUE
+)
+
+cat("AOI boundary saved to:\n", file.path(aoi_dir, "urban_regions_aoi.shp"), "\n\n")
+cat("CRS:", st_crs(aoi_boundary)$input, "\n")
+cat("Combined area (ha):", round(as.numeric(st_area(aoi_boundary)) / 10000, 1), "\n\n")
+cat("Files created:\n")
+print(list.files(aoi_dir, full.names = FALSE))
+```
+
+# Clip NFI to all urban regions (national, not just the MK test)
+
+Clips the national NFI file (4.36 GB) to the parts that intersect an
+urban region, using the dissolved boundary from `export_digimap_aoi` as
+the filter. Run that chunk first so that `aoi_boundary` exists. Woodland
+is taken as the union of LCM and NFI (a cell counts if either source
+classes it as woodland); this is implemented in
+`02_Resistance_Surface.Rmd`, which consumes `nfi_urban`.
+
+Two-stage filter:
+
+1. Stage 1 reads the local file with `wkt_filter`. The GeoJSON is in
+   WGS84 (CRS84), and GDAL compares filter coordinates with the layer's
+   own CRS without reprojecting, so `aoi_boundary` is reprojected to
+   WGS84 first. GeoJSON has no spatial index, so this is one sequential
+   scan of the whole file.
+2. Stage 2 applies a precise `st_intersects()` against the region
+   shapes, after an explicit `st_transform()` (both objects are nominally
+   EPSG:27700 but fail sf's strict CRS equality check). It is kept as a
+   safeguard because GDAL's spatial filter may test only bounding boxes
+   for this driver.
+
+The result is checkpointed, so this only needs to run once.
+
+```{r clip_nfi_urban_regions}
+library(sf)
+
+# aoi_boundary exists in memory only if export_digimap_aoi has run in
+# this session; otherwise load it from the shapefile that chunk saves.
+if (!exists("aoi_boundary")) {
+
+  aoi_boundary_path <- file.path(
+    checkpoint_dir, "digimap_aoi", "urban_regions_aoi.shp"
+  )
+
+  if (file.exists(aoi_boundary_path)) {
+    cat("aoi_boundary not in memory — loading it from the saved\n")
+    cat("shapefile (from a previous run of export_digimap_aoi).\n\n")
+    aoi_boundary <- st_read(aoi_boundary_path, quiet = TRUE)
+  } else {
+    stop(
+      "aoi_boundary not found in memory or on disk at ",
+      aoi_boundary_path, ". Run the export_digimap_aoi chunk first ",
+      "(it needs urban_regions_named, from name_urban_regions)."
+    )
+  }
+}
+
+cat("Stage 1: reading NFI within the urban-region boundary directly\n")
+cat("from the local file, filtered in the file's own CRS (WGS84).\n")
+cat("This is a full scan of the 4.36 GB file — expect a few minutes.\n\n")
+
+aoi_boundary_wgs84 <- st_transform(aoi_boundary, 4326)
+aoi_wkt <- st_as_text(st_geometry(aoi_boundary_wgs84))
+
+t_nfi_bbox <- system.time({
+  nfi_bbox_subset <- st_read(nfi_file, wkt_filter = aoi_wkt, quiet = TRUE)
+})
+
+print(t_nfi_bbox)
+cat("\nNFI features within urban-region boundary:", nrow(nfi_bbox_subset), "\n\n")
+
+# nfi_bbox_subset is read in WGS84 (the file's native CRS); transform it
+# back to British National Grid to match aoi_boundary.
+nfi_bbox_subset <- st_transform(nfi_bbox_subset, st_crs(aoi_boundary))
+
+cat("Stage 2: precise intersection against the actual region shapes\n")
+cat("(this is now working against a much smaller in-memory subset,\n")
+cat("not the full 641,642 national features)...\n")
+
+t_precise <- system.time({
+  intersects_urban <- st_intersects(nfi_bbox_subset, aoi_boundary, sparse = FALSE)[, 1]
+  nfi_urban <- nfi_bbox_subset[intersects_urban, ]
+})
+
+print(t_precise)
+
+cat("\nNFI features intersecting urban regions:", nrow(nfi_urban), "\n")
+cat("Combined NFI woodland area (ha):", round(sum(nfi_urban$Area_Ha), 1), "\n")
+
+saveRDS(
+  nfi_urban,
+  file.path(checkpoint_dir, "nfi_urban_regions.rds")
+)
+
+st_write(
+  nfi_urban,
+  file.path(checkpoint_dir, "nfi_urban_regions.gpkg"),
+  layer = "nfi_urban_regions",
+  delete_layer = TRUE,
+  quiet = TRUE
+)
+
+cat("\nSaved to:\n")
+cat(" -", file.path(checkpoint_dir, "nfi_urban_regions.rds"), "\n")
+cat(" -", file.path(checkpoint_dir, "nfi_urban_regions.gpkg"), "\n")
+```
+
+# National LCM vs NFI woodland map
+
+Side-by-side view of LCM and NFI woodland coverage at national scale.
+Needs `clip_nfi_urban_regions` to have finished. LCM is aggregated from
+10 m to 200 m cells (`fact = 20`, modal resampling), because full
+national detail is not visible at country scale and plotting England at
+full resolution is slow. Increase `agg_factor` for a coarser, faster map.
+
+```{r national_lcm_nfi_map}
+library(terra)
+
+agg_factor <- 20  # 10m x 20 = 200m cells
+
+aoi_bbox_sf <- st_as_sfc(st_bbox(aoi_boundary))
+
+cat("Cropping national LCM to the urban-regions extent...\n")
+
+t_lcm_crop <- system.time({
+  lcm_national <- rast(lcm_file) |>
+    crop(vect(aoi_bbox_sf))
+})
+
+print(t_lcm_crop)
+
+cat("Aggregating from 10m to", agg_factor * 10, "m cells...\n")
+
+t_lcm_agg <- system.time({
+  lcm_national_agg <- aggregate(lcm_national[[1]], fact = agg_factor, fun = "modal")
+})
+
+print(t_lcm_agg)
+
+lcm_woodland_national <- lcm_national_agg %in% c(1, 2)
+
+par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+
+plot(
+  lcm_woodland_national,
+  col = c("grey90", "darkgreen"),
+  legend = FALSE,
+  axes = FALSE,
+  main = paste0("LCM woodland, England (", agg_factor * 10, "m cells)")
+)
+
+plot(
+  st_geometry(nfi_urban),
+  col = "darkgreen",
+  border = NA,
+  main = "National Forest Inventory (urban regions)"
+)
+
+par(mfrow = c(1, 1))
+```
+
+The combined national woodland layer, and everything built on it (zoom
+plots and per-region rankings), is in `02_Resistance_Surface.Rmd`.

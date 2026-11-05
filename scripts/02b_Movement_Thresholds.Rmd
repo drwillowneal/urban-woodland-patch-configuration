@@ -1,0 +1,268 @@
+---
+title: "02b Movement thresholds"
+output: html_notebook
+editor_options:
+  chunk_output_type: console
+---
+
+Derives the 59, 99 and 512 m movement thresholds used throughout the
+pipeline. Extracts every British-species row from the European butterfly
+movement-distance compilation (Phaidra, univie.ac.at) that qualifies as a
+mean movement distance (MDD), collapses these to one value per species,
+and cross-references them with the urban-associated species list from the
+author's thesis. The species tables are written to
+`data/movement_distances/`. The thresholds themselves are set in
+`03_National_ECS.Rmd` (`fixed_thresholds`).
+
+```{r setup}
+source(here::here("scripts", "00_setup.R"))
+library(readxl)
+library(dplyr)
+
+path <- file.path(raw_data_dir, "European_butterflies_movement_distances.xlsx")
+```
+
+# Load the workbook
+
+Reads the three sheets of the workbook: the species codes, the movement distances and the sources.
+
+```{r load_sheets}
+species_codes <- read_excel(path, sheet = "Species codes")
+movement      <- read_excel(path, sheet = "Movement distances")
+sources       <- read_excel(path, sheet = "Sources")
+
+cat("Movement-distance rows (all species):", nrow(movement), "\n")
+cat("Species in the code list:", nrow(species_codes), "\n")
+cat("Sources cited:", nrow(sources), "\n")
+```
+
+# Define the British species list
+
+Standard British resident/breeding butterfly species; excludes rare
+migrants and long-extinct species not part of the current fauna.
+
+```{r british_species_list}
+british_species <- c(
+  "Aglais io", "Aglais urticae", "Anthocharis cardamines", "Aphantopus hyperantus",
+  "Argynnis adippe", "Argynnis aglaja", "Aricia agestis", "Aricia artaxerxes",
+  "Boloria euphrosyne", "Boloria selene", "Callophrys rubi", "Celastrina argiolus",
+  "Coenonympha pamphilus", "Coenonympha tullia", "Cupido minimus",
+  "Erebia aethiops", "Erebia epiphron", "Erynnis tages", "Euphydryas aurinia",
+  "Gonepteryx rhamni", "Hamearis lucina", "Hesperia comma", "Hipparchia semele",
+  "Lasiommata megera", "Leptidea sinapis", "Lycaena phlaeas",
+  "Lysandra bellargus", "Lysandra coridon", "Maniola jurtina",
+  "Melitaea athalia", "Melitaea cinxia", "Melanargia galathea",
+  "Nymphalis c-album", "Ochlodes sylvanus", "Pararge aegeria",
+  "Phengaris arion", "Pieris brassicae", "Pieris napi", "Pieris rapae",
+  "Plebejus argus", "Polyommatus icarus", "Pyrgus malvae", "Pyronia tithonus",
+  "Satyrium pruni", "Thymelicus acteon", "Thymelicus lineola",
+  "Thymelicus sylvestris", "Vanessa atalanta"
+)
+
+british_codes <- species_codes |> filter(Species %in% british_species)
+cat("British species matched in this workbook's code list:", nrow(british_codes), "of", length(british_species), "\n")
+```
+
+# Join and clean
+
+Keeps the movement-distance rows for British species and attaches each row's source details.
+
+```{r join_and_clean}
+data <- movement |>
+  inner_join(british_codes, by = "SpeciesCode") |>
+  left_join(sources, by = c("SourceID" = "Source ID")) |>
+  # MovementDistance is stored as text in the source file. A handful of
+  # rows hold inequality-bounded values such as "<500" or ">1000", which
+  # cannot be a single mean and become NA here.
+  mutate(MovementDistance = suppressWarnings(as.numeric(MovementDistance)))
+
+cat("British-species movement-distance rows:", nrow(data), "\n")
+```
+
+# Filter to a mean movement distance metric
+
+Keeps only rows directly comparable to Sekar (2012)'s mean dispersal
+distance:
+
+- `DistanceType == "Distance between successive captures"`, the standard
+  mark-recapture movement-distance metric. This excludes "sum of
+  distances between points of capture" (cumulative track length, not a
+  movement distance), "distance between first and last capture" (net
+  displacement, sensitive to how long the study ran), "length of flight
+  path" (within-territory patrol tracking) and "colonisation distance" (a
+  rare long-range event on a different scale, km rather than m).
+- `TypeOfValue == "mean"`, not median, maximum, SD, SE or an individual
+  example.
+- `CompleteDataset == "Yes"`, the study's full dataset rather than a
+  filtered subset.
+
+Every qualifying row is kept individually (sex-specific and combined)
+rather than pre-aggregated to one number per species, so each source and
+sample size stays visible and any aggregation decision can be made by
+inspection.
+
+```{r filter_qualifying}
+qualifying <- data |>
+  filter(
+    DistanceType == "Distance between successive captures",
+    TypeOfValue == "mean",
+    CompleteDataset == "Yes",
+    !is.na(MovementDistance)
+  ) |>
+  dplyr::select(Species, MovementDistance, Sex, nMoveTotal, SourceID, Reference) |>
+  arrange(Species, MovementDistance)
+
+cat("Qualifying rows:", nrow(qualifying), "\n")
+cat("British species with at least one qualifying row:", length(unique(qualifying$Species)), "of", length(british_species), "\n")
+```
+
+# Results
+
+```{r print_results}
+print(as.data.frame(qualifying), row.names = FALSE)
+```
+
+Writes the qualifying rows to a CSV in `data/movement_distances/`.
+
+```{r write_csv}
+out_path <- here::here("data", "movement_distances", "british_species_movement_distances.csv")
+write.csv(qualifying, out_path, row.names = FALSE)
+cat("Written to:", out_path, "\n")
+```
+
+# One value per species
+
+Collapses `qualifying` to one figure per species. Rows for both sexes
+(`Sex == "B"`) are preferred where a source reports them, as the pooled
+population-level estimate that a single MDD per species represents. If no
+source reported a combined value, male and female rows are averaged; if
+neither exists, sex-unspecified rows (`Sex` is `NA`) are used. The
+workbook's own column description says an unspecified sex "in most of
+these cases... likely pertains to both sexes", so these rows are treated
+as equivalent to "B" rather than dropped.
+
+`%in%` is used for the sex checks rather than `==`, because `==` against
+a column containing `NA` returns `NA` rather than `FALSE` (`NA == "B"` is
+`NA`), which breaks `any()` and `case_when()` logic downstream.
+
+```{r one_value_per_species}
+# The source workbook stores "sex not reported" as the literal text "NA",
+# not a true missing value (is.na(Sex) is FALSE for these rows, while
+# Sex == "NA" is TRUE). is.na() alone misses them, so both are checked.
+is_unspecified_sex <- function(x) is.na(x) | x == "NA"
+
+per_species <- qualifying |>
+  group_by(Species) |>
+  summarise(
+    n_rows      = n(),
+    value_both  = mean(MovementDistance[Sex %in% "B"]),
+    value_mf    = mean(MovementDistance[Sex %in% c("M", "F")]),
+    value_nasex = mean(MovementDistance[is_unspecified_sex(Sex)]),
+    .groups = "drop"
+  ) |>
+  mutate(
+    MDD = case_when(
+      !is.nan(value_both)  ~ value_both,
+      !is.nan(value_mf)    ~ value_mf,
+      !is.nan(value_nasex) ~ value_nasex
+    ),
+    basis = case_when(
+      !is.nan(value_both)  ~ "both sexes",
+      !is.nan(value_mf)    ~ "M/F averaged",
+      !is.nan(value_nasex) ~ "sex unspecified"
+    )
+  ) |>
+  dplyr::select(Species, MDD, basis, n_rows) |>
+  arrange(MDD)
+
+cat("Species with a usable value:", nrow(per_species), "of", length(british_species), "\n\n")
+print(as.data.frame(per_species |> mutate(MDD = round(MDD, 1))), row.names = FALSE)
+
+out_path2 <- here::here("data", "movement_distances", "british_species_mdd_one_per_species.csv")
+write.csv(per_species, out_path2, row.names = FALSE)
+cat("\nWritten to:", out_path2, "\n")
+```
+
+# Species with no qualifying row
+
+These species need a different metric, or are not in the compilation for
+this `DistanceType`.
+
+```{r missing_species}
+print(setdiff(british_species, unique(qualifying$Species)))
+```
+
+# Cross-reference against the thesis's urban-associated species list
+
+Table 2.4 of the thesis (Neal, 2025) lists the urban-associated species
+the study is built around, each with its habitat specialism as classified
+there. This checks which of them have a usable MDD in `per_species`
+above.
+
+```{r thesis_species_list}
+thesis_species <- tribble(
+  ~Species,                    ~CommonName,                ~Family,        ~RedListStatus,  ~HabitatSpecialist,
+  "Aglais io",                  "Peacock",                  "Nymphalidae",  "Least concern",  "No",
+  "Aglais urticae",             "Small Tortoiseshell",      "Nymphalidae",  "Least concern",  "No",
+  "Anthocharis cardamines",     "Orange-tip",                "Pieridae",     "Least concern",  "No",
+  "Apatura iris",                "Purple Emperor",           "Nymphalidae",  "Least concern",  "Woodland",
+  "Aphantopus hyperantus",      "Ringlet",                   "Nymphalidae",  "Least concern",  "No",
+  "Argynnis paphia",             "Silver-Washed Fritillary",  "Nymphalidae",  "Least concern",  "Woodland",
+  "Aricia agestis",              "Brown Argus",               "Lycaenidae",   "Least concern",  "No",
+  "Celastrina argiolus",         "Holly Blue",                "Lycaenidae",   "Least concern",  "No",
+  "Colias crocea",               "Clouded Yellow",            "Pieridae",     "Least concern",  "No",
+  "Cupido minimus",              "Small Blue",                "Lycaenidae",   "Near Threatened","Chalk grassland",
+  "Favonius quercus",            "Purple Hairstreak",         "Lycaenidae",   "Least concern",  "No",
+  "Gonepteryx rhamni",           "Brimstone",                 "Pieridae",     "Least concern",  "No",
+  "Lasiommata megera",           "Wall Brown",                 "Nymphalidae",  "Endangered",     "No",
+  "Limenitis camilla",           "White Admiral",              "Nymphalidae",  "Vulnerable",     "Woodland",
+  "Lycaena phlaeas",             "Small Copper",               "Lycaenidae",   "Least concern",  "No",
+  "Maniola jurtina",             "Meadow Brown",               "Nymphalidae",  "Least concern",  "No",
+  "Melanargia galathea",         "Marbled White",              "Nymphalidae",  "Least concern",  "No",
+  "Ochlodes sylvanus",           "Large Skipper",              "Hesperiidae",  "Least concern",  "No",
+  "Pararge aegeria",             "Speckled Wood",              "Nymphalidae",  "Least concern",  "No",
+  "Pieris brassicae",            "Large White",                "Pieridae",     "Least concern",  "No",
+  "Pieris napi",                 "Green-veined White",         "Pieridae",     "Least concern",  "No",
+  "Pieris rapae",                "Small White",                "Pieridae",     "Least concern",  "No",
+  "Polygonia c-album",           "Comma",                      "Nymphalidae",  "Least concern",  "No",
+  "Polyommatus icarus",          "Common Blue",                "Lycaenidae",   "Least concern",  "No",
+  "Pyronia tithonus",            "Gatekeeper",                 "Nymphalidae",  "Least concern",  "No",
+  "Satyrium w-album",            "White-letter Hairstreak",    "Lycaenidae",   "Vulnerable",     "No",
+  "Thymelicus lineola",          "Essex Skipper",              "Hesperiidae",  "Least concern",  "No",
+  "Thymelicus sylvestris",       "Small Skipper",              "Hesperiidae",  "Least concern",  "No",
+  "Vanessa atalanta",            "Red Admiral",                "Nymphalidae",  "Least concern",  "No",
+  "Vanessa cardui",              "Painted Lady",                "Nymphalidae",  "Least concern",  "No"
+)
+
+cat("Thesis urban-associated species list: n =", nrow(thesis_species), "\n")
+```
+
+Two species with a qualifying MDD are excluded here, although
+`HabitatSpecialist` in the thesis table does not flag both of them:
+*Cupido minimus* is flagged there as a chalk grassland specialist, but
+*Aricia agestis* is marked "No" despite also being a grassland species
+in practice. Neither is a plausible match for a woodland connectivity
+threshold, so both are excluded manually rather than by filtering on
+`HabitatSpecialist` alone.
+
+```{r thesis_comparison}
+non_woodland_exclusions <- c("Cupido minimus", "Aricia agestis")
+
+thesis_matched <- thesis_species |>
+  inner_join(per_species, by = "Species") |>
+  filter(!Species %in% non_woodland_exclusions) |>
+  arrange(MDD)
+
+cat("Thesis species with a usable MDD:", nrow(thesis_matched) + length(non_woodland_exclusions),
+    "of", nrow(thesis_species), "\n")
+cat("After excluding non-woodland specialists:", nrow(thesis_matched), "\n\n")
+
+print(as.data.frame(thesis_matched |> mutate(MDD = round(MDD, 1))), row.names = FALSE)
+
+out_path3 <- here::here("data", "movement_distances", "thesis_species_mdd_matched.csv")
+write.csv(thesis_matched, out_path3, row.names = FALSE)
+cat("\nWritten to:", out_path3, "\n")
+
+cat("\nThesis species with no usable MDD under this filter:\n")
+print(setdiff(thesis_species$Species, per_species$Species) |> sort())
+```

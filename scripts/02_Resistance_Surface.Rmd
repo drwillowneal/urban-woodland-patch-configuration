@@ -1,0 +1,615 @@
+---
+title: "02 Resistance surface"
+output: html_notebook
+editor_options:
+  chunk_output_type: console
+---
+
+Builds the national resistance surface. Starts from the LCM land-cover
+classification, adds the NFI woodland layer (a cell is woodland if either
+LCM or NFI classes it so) and assigns a resistance value to each
+land-cover class. Also fetches the ONS Major Towns and Cities boundaries
+used to identify the designated places in each region. Loads
+`urban_regions_named` and `nfi_urban` from their saved checkpoints, so it
+does not depend on `01b_Analyse_Urban_Regions.Rmd` having been run in the
+same session.
+
+```{r setup}
+source(here::here("scripts", "00_setup.R"))
+```
+
+# Load checkpoints
+
+Loads the named urban regions and the clipped NFI woodland polygons saved by `01b`.
+
+```{r load_checkpoints}
+library(sf)
+
+urban_regions_named <- readRDS(
+  file.path(checkpoint_dir, "07b_urban_regions_named.rds")
+)
+
+nfi_urban <- readRDS(
+  file.path(checkpoint_dir, "nfi_urban_regions.rds")
+)
+
+cat("urban_regions_named:", nrow(urban_regions_named), "regions\n")
+cat("nfi_urban:", nrow(nfi_urban), "features\n")
+```
+
+# National LCM base layer (full classification)
+
+Crops the national LCM raster to the urban-regions extent and aggregates
+it from 10 m to 200 m cells (modal resampling), because full detail is
+not visible at country scale and is slow to crop and plot nationally.
+All LCM classes are kept, not just woodland, because the resistance
+surface assigns a value to every class. The NFI woodland is added in the
+next chunk. Increase `agg_factor` for a coarser, faster layer.
+
+This chunk and the next (`national_lcm_nfi_classified`) are the slow part
+of the notebook: they crop, aggregate and rasterise the NFI over England.
+Both load `lcm_nfi_classified.tif` if it already exists, so later chunks
+can be re-run without them. Delete that file (or the whole
+`checkpoint_dir`) to force a rebuild after changing `agg_factor`, the
+woodland rule or the source data.
+
+```{r national_lcm_woodland_base}
+library(terra)
+
+agg_factor <- 20  # 10m x 20 = 200m cells
+
+lcm_classified_checkpoint <- file.path(checkpoint_dir, "lcm_nfi_classified.tif")
+
+if (file.exists(lcm_classified_checkpoint)) {
+
+  cat("lcm_nfi_classified checkpoint found -- skipping national LCM crop/aggregate (loaded in the next chunk instead).\n")
+
+} else {
+
+  urban_regions_bbox_sfc <- st_as_sfc(st_bbox(urban_regions_named))
+
+  cat("Cropping national LCM to the urban-regions extent...\n")
+
+  t_lcm_crop <- system.time({
+    lcm_national <- rast(lcm_file) |>
+      crop(vect(urban_regions_bbox_sfc))
+  })
+
+  print(t_lcm_crop)
+
+  cat("Aggregating from 10m to", agg_factor * 10, "m cells...\n")
+
+  t_lcm_agg <- system.time({
+    lcm_national_agg <- aggregate(lcm_national[[1]], fact = agg_factor, fun = "modal")
+  })
+
+  print(t_lcm_agg)
+
+}
+```
+
+# National LCM + NFI classified map (full classification, woodland patched)
+
+Keeps every LCM class as it is, except that all woodland (LCM class 1,
+broadleaved, and class 2, coniferous, plus any cell NFI flags as
+woodland) is merged into a single class, 1 "Woodland". Once a cell is
+woodland its source does not matter, so this is a union of the two
+sources rather than a replacement of one by the other. Urban region
+boundaries are overlaid for context.
+
+```{r national_lcm_nfi_classified}
+library(terra)
+
+woodland_code <- 1
+lcm_present_vals_checkpoint <- file.path(checkpoint_dir, "lcm_nfi_classified_present_vals.rds")
+
+if (file.exists(lcm_classified_checkpoint) && file.exists(lcm_present_vals_checkpoint)) {
+
+  cat("Loading lcm_nfi_classified from checkpoint...\n")
+  lcm_nfi_classified <- rast(lcm_classified_checkpoint)
+  present_vals <- readRDS(lcm_present_vals_checkpoint)
+
+} else {
+
+  cat("Rasterising NFI onto the same grid as the LCM classification...\n")
+
+  t_nfi_rasterise <- system.time({
+    nfi_national_raster <- rasterize(
+      vect(nfi_urban), lcm_national_agg, field = 1, background = 0
+    )
+  })
+
+  print(t_nfi_rasterise)
+
+  # All woodland (LCM classes 1 and 2, plus any cell NFI flags) becomes a
+  # single class, 1 "Woodland".
+  lcm_nfi_classified <- lcm_national_agg
+  lcm_nfi_classified[
+    (lcm_national_agg %in% c(1, 2)) | (nfi_national_raster > 0)
+  ] <- woodland_code
+
+  present_vals <- sort(unique(values(lcm_nfi_classified, na.rm = TRUE)))
+
+  cat("Saving checkpoint (", lcm_classified_checkpoint, ")...\n")
+  writeRaster(lcm_nfi_classified, lcm_classified_checkpoint, overwrite = TRUE)
+  saveRDS(present_vals, lcm_present_vals_checkpoint)
+
+}
+
+lcm_class_labels <- c(
+  `1` = "Woodland",
+  `3` = "Arable", `4` = "Improved grassland", `5` = "Neutral grassland",
+  `6` = "Calcareous grassland", `7` = "Acid grassland",
+  `8` = "Fen, marsh, swamp", `9` = "Heather", `10` = "Heather grassland",
+  `11` = "Bog", `12` = "Inland rock", `13` = "Saltwater",
+  `14` = "Freshwater", `15` = "Supra-littoral rock",
+  `16` = "Supra-littoral sediment", `17` = "Littoral rock",
+  `18` = "Littoral sediment", `19` = "Saltmarsh", `20` = "Urban",
+  `21` = "Suburban"
+)
+
+# Explicit colours, grouped by land-cover family so that classes within a
+# family are graded but distinct from the other families: greens for
+# grassland, purples for heather, browns for wetland and bog, sandy tones
+# for coastal sediment, greys for rock and urban, blues for water.
+lcm_class_colours <- c(
+  `1`  = "#1b5e20",  # Woodland -- dark green
+  `3`  = "#d9a066",  # Arable -- tan/wheat
+  `4`  = "#66bb6a",  # Improved grassland -- medium green
+  `5`  = "#9ccc65",  # Neutral grassland -- yellow-green
+  `6`  = "#c5e1a5",  # Calcareous grassland -- pale yellow-green
+  `7`  = "#558b2f",  # Acid grassland -- olive green
+  `8`  = "#6d4c41",  # Fen, marsh, swamp -- brown
+  `9`  = "#8e44ad",  # Heather -- purple
+  `10` = "#b39ddb",  # Heather grassland -- pale purple
+  `11` = "#5d4037",  # Bog -- dark brown
+  `12` = "#bfbfbf",  # Inland rock -- grey
+  `13` = "#1565c0",  # Saltwater -- dark blue
+  `14` = "#64b5f6",  # Freshwater -- light blue
+  `15` = "#a6a6a6",  # Supra-littoral rock -- grey
+  `16` = "#e0c9a6",  # Supra-littoral sediment -- sandy
+  `17` = "#999999",  # Littoral rock -- grey
+  `18` = "#f0e0b0",  # Littoral sediment -- pale sandy
+  `19` = "#ce93d8",  # Saltmarsh -- pink-purple
+  `20` = "#4d4d4d",  # Urban -- dark grey
+  `21` = "#8c8c8c"   # Suburban -- medium grey
+)
+
+# Drop any value with no entry in lcm_class_labels (for example LCM's
+# no-data value, often 0), so it does not appear as a blank legend swatch.
+unlabelled_vals <- setdiff(present_vals, as.numeric(names(lcm_class_labels)))
+if (length(unlabelled_vals) > 0) {
+  cat(
+    "WARNING: dropping", length(unlabelled_vals),
+    "value(s) present in the data with no entry in lcm_class_labels:",
+    paste(unlabelled_vals, collapse = ", "), "\n\n"
+  )
+  present_vals <- setdiff(present_vals, unlabelled_vals)
+}
+
+present_vals_chr <- as.character(present_vals)
+
+plot(
+  lcm_nfi_classified,
+  type = "classes",
+  levels = lcm_class_labels[present_vals_chr],
+  col = lcm_class_colours[present_vals_chr],
+  axes = FALSE,
+  plg = list(cex = 0.6),
+  main = "Land cover classification: LCM + NFI-patched woodland, England"
+)
+
+plot(vect(urban_regions_named), border = "black", lwd = 0.2, add = TRUE)
+
+woodland_ha_check <- sum(values(lcm_nfi_classified) == woodland_code, na.rm = TRUE) *
+  prod(res(lcm_nfi_classified)) / 10000
+
+cat("\nTotal woodland (LCM + NFI union, whole cropped extent):",
+    round(woodland_ha_check, 1), "ha\n")
+```
+
+# Same map, with Wales/Scotland/sea greyed out
+
+The crop is a rectangular bounding box around all English urban regions,
+so it also includes land cover for Wales and the southern edge of
+Scotland. This masks everything outside England to a single grey
+category, because the analysis is England only.
+
+Uses the ONS "Countries (December 2022) Boundaries UK" dataset,
+**BUC (ultra-generalised)** rather than BFC (full-resolution coastline).
+BFC is a single very large multipart polygon (32 MB) that GDAL's GeoJSON
+parser cannot read as one object, and a 200 m raster does not need its
+precision.
+
+```{r national_lcm_nfi_classified_england_only}
+library(sf)
+
+england_url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Countries_December_2022_UK_BUC/FeatureServer/0/query?",
+  "where=CTRY22NM='England'&outFields=CTRY22NM&outSR=27700&f=geojson"
+)
+
+# Download to a local temp file rather than calling st_read() on the URL,
+# which returns correct attributes but empty geometry for this service
+# (the same problem as in fetch_nfi_bbox in 00_setup.R).
+tmp_file <- tempfile(fileext = ".geojson")
+download.file(england_url, tmp_file, quiet = TRUE, mode = "wb")
+england_boundary <- st_read(tmp_file, quiet = TRUE)
+unlink(tmp_file)
+
+outside_england_code <- 99
+
+england_mask <- rasterize(vect(england_boundary), lcm_nfi_classified, field = 1, background = 0)
+
+lcm_nfi_classified_england <- lcm_nfi_classified
+lcm_nfi_classified_england[england_mask == 0] <- outside_england_code
+
+lcm_class_labels_england <- c(lcm_class_labels, `99` = "Outside England")
+lcm_class_colours_england <- c(lcm_class_colours, `99` = "grey80")
+present_vals_england <- sort(unique(c(present_vals, outside_england_code)))
+present_vals_england_chr <- as.character(present_vals_england)
+
+plot(
+  lcm_nfi_classified_england,
+  type = "classes",
+  levels = lcm_class_labels_england[present_vals_england_chr],
+  col = lcm_class_colours_england[present_vals_england_chr],
+  axes = FALSE,
+  plg = list(cex = 0.6),
+  main = "Land cover classification: LCM + NFI-patched woodland, England"
+)
+
+plot(vect(urban_regions_named), border = "black", lwd = 0.2, add = TRUE)
+```
+
+# National urban woodland (LCM + NFI union, masked to urban regions)
+
+Derives a woodland/non-woodland boolean from `lcm_nfi_classified` (class
+1), then masks it to the `urban_regions_named` shapes so that only
+woodland inside a derived urban region remains. The classified map covers
+the whole bounding box, including rural land between cities. The zoom
+plots below use this layer.
+
+```{r national_urban_woodland_map}
+library(terra)
+
+urban_regions_vect <- vect(urban_regions_named)
+
+urban_woodland_national_unmasked <- lcm_nfi_classified == 1
+
+cat("Masking combined woodland to the actual urban region shapes...\n\n")
+
+t_mask <- system.time({
+  urban_woodland_national <- mask(urban_woodland_national_unmasked, urban_regions_vect)
+})
+
+print(t_mask)
+
+urban_woodland_ha <- sum(values(urban_woodland_national), na.rm = TRUE) *
+  res(urban_woodland_national)[1] * res(urban_woodland_national)[2] / 10000
+
+cat(
+  "Total urban woodland (LCM + NFI union, masked to urban regions):",
+  round(urban_woodland_ha, 1), "ha\n"
+)
+
+plot(
+  urban_woodland_national,
+  col = c("grey90", "darkgreen"),
+  legend = FALSE,
+  axes = FALSE,
+  main = paste0(
+    "Urban woodland only (LCM + NFI union), England (",
+    agg_factor * 10, "m cells)"
+  )
+)
+```
+
+# Zoom: urban woodland in Milton Keynes and London
+
+The national map above is aggregated to 200 m cells, which is too coarse
+to show local detail. This rebuilds the same layer (LCM + NFI union,
+masked to urban regions) at full 10 m resolution for one small bounding
+box at a time, which is cheap because cropping happens before any heavy
+computation.
+
+```{r zoom_urban_woodland_mk_london}
+library(terra)
+
+zoom_bboxes <- list(
+  "Milton Keynes" = st_bbox(
+    c(xmin = 467500, ymin = 227500, xmax = 492500, ymax = 252500),
+    crs = st_crs(27700)
+  ),
+  "London" = st_bbox(
+    c(xmin = 495000, ymin = 150000, xmax = 565000, ymax = 205000),
+    crs = st_crs(27700)
+  )
+)
+
+# Masks against the target region's own geometry rather than every urban
+# region in the padded bbox window, so unrelated neighbouring regions do
+# not appear to be part of the same place.
+plot_urban_woodland_zoom <- function(bbox, place_name, target_region) {
+
+  bbox_sfc <- st_as_sfc(bbox)
+
+  lcm_zoom <- rast(lcm_file) |> crop(vect(bbox_sfc))
+  lcm_woodland_zoom <- lcm_zoom[[1]] %in% c(1, 2)
+
+  # st_crop() on a polygon at the bbox edge can leave a degenerate sliver
+  # (a point or line), which makes the result a mixed GEOMETRYCOLLECTION
+  # that vect() cannot convert cleanly: it drops the geometry of the bad
+  # rows but not their attribute rows. st_collection_extract("POLYGON")
+  # keeps only the polygon parts and changes nothing for unaffected rows.
+  nfi_zoom <- st_crop(nfi_urban, bbox) |>
+    st_collection_extract("POLYGON")
+
+  nfi_zoom_raster <- rasterize(
+    vect(nfi_zoom), lcm_woodland_zoom, field = 1, background = 0
+  )
+
+  combined_zoom <- lcm_woodland_zoom | (nfi_zoom_raster > 0)
+
+  target_geom <- st_crop(target_region, bbox) |>
+    st_collection_extract("POLYGON")
+
+  urban_woodland_zoom <- mask(combined_zoom, vect(target_geom))
+
+  plot(
+    urban_woodland_zoom,
+    col = c("grey90", "darkgreen"),
+    legend = FALSE,
+    axes = FALSE,
+    main = paste0("Urban woodland: ", place_name)
+  )
+
+  woodland_ha <- sum(values(urban_woodland_zoom), na.rm = TRUE) *
+    res(urban_woodland_zoom)[1] * res(urban_woodland_zoom)[2] / 10000
+  cat(place_name, "urban woodland:", round(woodland_ha, 1), "ha\n")
+
+  invisible(urban_woodland_zoom)
+}
+
+par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+
+for (place in names(zoom_bboxes)) {
+  target_region <- urban_regions_named |> filter(bua_name == place)
+  plot_urban_woodland_zoom(zoom_bboxes[[place]], place, target_region)
+}
+
+par(mfrow = c(1, 1))
+```
+
+# Fetch ONS Major Towns and Cities boundaries
+
+ONS Major Towns and Cities (December 2015, V2) boundaries: 112 named
+towns and cities in England and Wales, built with the same Built-Up Areas
+methodology as this project's regions. They identify the designated
+places contained in each region. The data are already in EPSG:27700, and
+112 features fit in one request (the page limit is 2,000), so no
+pagination is needed.
+
+```{r fetch_major_towns_cities}
+library(sf)
+
+tcity_url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Major_Towns_and_Cities_Dec_2015_Boundaries_V2_2022/FeatureServer/0/query",
+  "?where=1=1&outFields=*&outSR=27700&f=geojson"
+)
+
+tmp_file <- tempfile(fileext = ".geojson")
+utils::download.file(tcity_url, tmp_file, quiet = TRUE, mode = "wb")
+major_towns_cities <- st_read(tmp_file, quiet = TRUE)
+unlink(tmp_file)
+
+cat("Major Towns and Cities boundaries fetched:", nrow(major_towns_cities), "\n")
+cat("CRS:", st_crs(major_towns_cities)$input, "\n")
+
+saveRDS(
+  major_towns_cities,
+  file.path(checkpoint_dir, "major_towns_cities.rds")
+)
+```
+
+# Assign resistance values
+
+`resistance_lookup` (Table 4.2 of the thesis; scale 1-10, higher is
+harder for a typical urban woodland butterfly to cross) is defined in
+`00_setup.R`. It is applied here to build the national 200 m resistance
+surface for mapping; the per-region surfaces used for the connectivity
+analysis are built in `03_National_ECS.Rmd`.
+
+```{r assign_resistance_values}
+library(terra)
+
+if (!exists("lcm_nfi_classified")) {
+  stop("lcm_nfi_classified not found. Run national_lcm_nfi_classified first.")
+}
+
+# resistance_lookup comes from 00_setup.R.
+#
+# others = NA: subst() leaves cell values not in `from` unchanged,
+# including LCM's no-data value (0, sea or outside the crop). Left as 0
+# they would plot as a real resistance bin; others = NA maps them to NA
+# so they render as blank.
+resistance_surface <- subst(
+  lcm_nfi_classified,
+  from = as.numeric(names(resistance_lookup)),
+  to = as.numeric(resistance_lookup),
+  others = NA
+)
+
+present_vals <- sort(unique(values(lcm_nfi_classified, na.rm = TRUE)))
+missing_from_lookup <- setdiff(present_vals, as.numeric(names(resistance_lookup)))
+if (length(missing_from_lookup) > 0) {
+  cat(
+    "WARNING: classes present in the data with no resistance value assigned",
+    "(mapped to NA in resistance_surface, not a bug -- e.g. LCM's no-data",
+    "sentinel, 0):", paste(missing_from_lookup, collapse = ", "), "\n\n"
+  )
+}
+
+cat("Resistance surface built. Value summary:\n")
+print(summary(values(resistance_surface)))
+
+# Wales and Scotland get their own grey category (true sea stays NA and
+# renders white). England's boundary is used as an exclusion test (is the
+# cell outside England?) rather than using Wales and Scotland boundaries
+# as an inclusion test. The England boundary is the generalised BUC
+# version, whose simplified edges cut inside the true coastline in places.
+# An inclusion test would leave coastal land showing in its original
+# colour where the simplification cuts short, whereas an exclusion test
+# only needs a cell to be clearly outside England.
+if (!exists("england_mask")) {
+  if (!exists("england_boundary")) {
+    library(sf)
+    england_url <- paste0(
+      "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+      "Countries_December_2022_UK_BUC/FeatureServer/0/query?",
+      "where=CTRY22NM='England'&outFields=CTRY22NM&outSR=27700&f=geojson"
+    )
+    tmp_file <- tempfile(fileext = ".geojson")
+    download.file(england_url, tmp_file, quiet = TRUE, mode = "wb")
+    england_boundary <- st_read(tmp_file, quiet = TRUE)
+    unlink(tmp_file)
+  }
+  england_mask <- rasterize(vect(england_boundary), lcm_nfi_classified, field = 1, background = 0)
+}
+
+wales_scotland_code <- 99
+
+lcm_nfi_classified_england <- lcm_nfi_classified
+# Only recode cells that still hold a real land-cover value (not the
+# literal 0 for no data or sea), otherwise true sea cells outside England
+# would also be greyed out.
+outside_england_real_land <- (england_mask == 0) & (lcm_nfi_classified_england != 0)
+lcm_nfi_classified_england[outside_england_real_land] <- wales_scotland_code
+# Anything still 0 at this point (true sea, or a few stray no-data cells
+# inside England) becomes NA, so it renders as blank rather than taking a
+# colour from the table below.
+lcm_nfi_classified_england[lcm_nfi_classified_england == 0] <- NA
+
+# Colours for this plot: forest green for Woodland alone; yellows and
+# oranges for grassland and arable; two purples for heather and heather
+# grassland; browns for fen, marsh, swamp and bog; teal for saltwater and
+# blue for freshwater; dusty pink-mauve for saltmarsh; dark and medium
+# grey for urban and suburban; muted tans and greys for rock and sediment.
+resistance_plot_labels <- c(lcm_class_labels, `99` = "Wales / Scotland")
+resistance_plot_colours <- c(
+  `1`  = "#1b5e20",  # Woodland -- forest green
+  `3`  = "#e8a33d",  # Arable -- orange
+  `4`  = "#7cb342",  # Improved grassland -- yellow
+  `5`  = "#e0c14c",  # Neutral grassland -- yellow
+  `6`  = "#d4b83c",  # Calcareous grassland -- yellow
+  `7`  = "#c9a227",  # Acid grassland -- deeper yellow/ochre
+  `8`  = "#8d6e52",  # Fen, marsh, swamp -- brown
+  `9`  = "#9575cd",  # Heather -- purple
+  `10` = "#b39ddb",  # Heather grassland -- pale purple
+  `11` = "#6d4c35",  # Bog -- brown
+  `12` = "#b0a89a",  # Inland rock -- muted tan/grey
+  `13` = "#2a9d8f",  # Saltwater -- teal
+  `14` = "#4a90d9",  # Freshwater -- blue
+  `15` = "#c2b8a3",  # Supra-littoral rock -- muted tan
+  `16` = "#cabb9c",  # Supra-littoral sediment -- muted tan
+  `17` = "#a89f91",  # Littoral rock -- muted grey
+  `18` = "#d1c3a3",  # Littoral sediment -- muted tan
+  `19` = "#c98fb0",  # Saltmarsh -- dusty pink-mauve
+  `20` = "#4d4d4d",  # Urban -- dark grey
+  `21` = "#8c8c8c",  # Suburban -- medium grey
+  `99` = "grey85"    # Wales / Scotland
+)
+# Uses terra's built-in legend (plg =) rather than a custom legend()
+# call, for reliable rendering. The trade-off is that the rock and
+# sediment classes and "Outside England" also appear in the legend.
+present_vals_england_classes <- sort(unique(values(lcm_nfi_classified_england, na.rm = TRUE)))
+present_vals_england_classes_chr <- as.character(present_vals_england_classes)
+
+plot(
+  lcm_nfi_classified_england,
+  type = "classes",
+  levels = resistance_plot_labels[present_vals_england_classes_chr],
+  col = resistance_plot_colours[present_vals_england_classes_chr],
+  axes = FALSE,
+  plg = list(cex = 0.7, title = "Surface type"),
+  main = "Resistance surface, England"
+)
+
+plot(vect(urban_regions_named), border = "black", lwd = 0.2, add = TRUE)
+
+saveRDS(
+  resistance_lookup,
+  file.path(checkpoint_dir, "resistance_lookup.rds")
+)
+
+writeRaster(
+  resistance_surface,
+  file.path(checkpoint_dir, "resistance_surface.tif"),
+  overwrite = TRUE
+)
+
+cat("\nSaved to:\n")
+cat(" -", file.path(checkpoint_dir, "resistance_lookup.rds"), "\n")
+cat(" -", file.path(checkpoint_dir, "resistance_surface.tif"), "\n")
+```
+
+# Zoom: resistance surface at native 10m resolution
+
+The national map above is aggregated to 200 m cells for speed, which
+understates urban woodland: most urban woodland is in small, sub-hectare
+patches that a 4 ha (200 m) modal cell absorbs into "Urban" wherever
+urban is more prevalent in the cell. This rebuilds the classified surface
+(same LCM + NFI union rule and colours as `assign_resistance_values`
+above) at native 10 m resolution for one small bounding box at a time,
+which is cheap because cropping happens before any heavy computation. Use
+it to check the national map or for figures that need local detail.
+
+```{r zoom_resistance_surface}
+library(terra)
+
+plot_resistance_zoom <- function(bbox, place_name) {
+
+  bbox_sfc <- st_as_sfc(bbox)
+
+  lcm_zoom <- rast(lcm_file) |> crop(vect(bbox_sfc))
+
+  nfi_zoom <- st_crop(nfi_urban, bbox) |> st_collection_extract("POLYGON")
+  nfi_zoom_raster <- rasterize(vect(nfi_zoom), lcm_zoom[[1]], field = 1, background = 0)
+
+  woodland_code <- 1
+  lcm_zoom_classified <- lcm_zoom[[1]]
+  lcm_zoom_classified[
+    (lcm_zoom[[1]] %in% c(1, 2)) | (nfi_zoom_raster > 0)
+  ] <- woodland_code
+  lcm_zoom_classified[lcm_zoom_classified == 0] <- NA
+
+  present_vals_zoom <- sort(unique(values(lcm_zoom_classified, na.rm = TRUE)))
+  present_vals_zoom_chr <- as.character(present_vals_zoom)
+
+  plot(
+    lcm_zoom_classified,
+    type = "classes",
+    levels = resistance_plot_labels[present_vals_zoom_chr],
+    col = resistance_plot_colours[present_vals_zoom_chr],
+    axes = FALSE,
+    plg = list(cex = 0.7, title = "Surface type"),
+    main = paste0("Resistance surface -- ", place_name, " (native 10m)")
+  )
+  plot(vect(urban_regions_named), border = "black", lwd = 0.4, add = TRUE)
+
+  woodland_ha <- sum(values(lcm_zoom_classified) == woodland_code, na.rm = TRUE) *
+    prod(res(lcm_zoom_classified)) / 10000
+  cat(place_name, "woodland (native 10m):", round(woodland_ha, 1), "ha\n")
+
+  invisible(lcm_zoom_classified)
+}
+
+london_bbox <- st_bbox(
+  c(xmin = 495000, ymin = 150000, xmax = 565000, ymax = 205000),
+  crs = st_crs(27700)
+)
+
+plot_resistance_zoom(london_bbox, "London")
+```

@@ -1,0 +1,9 @@
+# Optional. Copy this file to `.Renviron` in the project root and edit the paths.
+# If these are not set, the pipeline uses scripts/input/ for the input data and
+# scripts/checkpoints/ for saved intermediate results.
+#
+# URBAN_WOODLAND_INPUT: folder holding the downloaded input data (see scripts/input/README.md).
+# URBAN_WOODLAND_CHECKPOINTS: folder for the pipeline's saved intermediate results
+# (about 2 GB once the national run has finished).
+URBAN_WOODLAND_INPUT="D:/path/to/input_data"
+URBAN_WOODLAND_CHECKPOINTS="D:/path/to/checkpoints"

@@ -1,0 +1,844 @@
+---
+title: "01a Prepare Built Up Area groups"
+output: html_notebook
+editor_options:
+  chunk_output_type: console
+---
+
+Builds the urban regions: groups ONS Built Up Areas (BUAs) that lie close
+together, closes small gaps with an area-scaled buffer, fills enclosed
+holes and splits the result into individual regions. Results are saved to
+`urban_region_checkpoints/`, which `01b_Analyse_Urban_Regions.Rmd` reads.
+Re-run this notebook only if the input data or a parameter changes.
+
+```{r setup}
+source(here::here("scripts", "00_setup.R"))
+```
+
+# Prepare BUA data (filter to England, join population)
+
+```{r prepare_bua_data}
+# Filter to England using the LSOA-to-Region lookup rather than the
+# census population table. LSOAs cover the whole country without gaps,
+# whereas the census table's BUA22 codes do not match for central London,
+# so a semi_join against it would drop inner London from `bua`.
+england_buas <- lsoa_lookup |>
+  filter(startsWith(RGN22CD, "E12")) |>
+  distinct(BUA22CD)
+
+bua <- bua |>
+  semi_join(england_buas, by = "BUA22CD")
+
+# Add population counts and names. A left_join keeps any BUA missing from
+# the census population table, with population = NA.
+bua <- bua |>
+  left_join(
+    census |>
+      select(
+        BUA22CD = `BUA code`,
+        population = Counts,
+        size_classification = `BUA size classification`
+      ),
+    by = "BUA22CD"
+  )
+```
+
+# Derive urban regions (buffer, group, close, fill holes, split)
+
+Runs the whole build in the steps below: it checks the input geometry, links BUAs that lie close together, closes small gaps with a buffer scaled to each group's area, fills enclosed holes and splits the result into regions. Each step saves its result to `checkpoint_dir`, and the group-closing step resumes from the groups already saved.
+
+```{r derive_urban_regions}
+library(sf)
+library(dplyr)
+library(igraph)
+library(parallel)
+
+# Settings
+
+# coefficient and checkpoint_dir are defined in 00_setup.R.
+
+dir.create(
+  checkpoint_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# Use all but one core for the parallel group-closing step.
+# mclapply() errors if mc.cores > 1 on Windows (it does NOT fall back
+# to serial automatically), so cap at 1 core there.
+n_cores <- if (.Platform$OS.type == "windows") {
+  1
+} else {
+  max(1, parallel::detectCores() - 1)
+}
+
+# Optional simplification tolerance (metres) applied to the input BUAs
+# before buffering, to reduce vertex density on detailed boundaries.
+# NULL skips simplification.
+simplify_tolerance <- NULL
+
+# Fix geometry column name
+
+# The source data stores geometry in a column called "SHAPE" rather
+# than the sf default "geometry". Rename it once here so every
+# downstream call (st_buffer(geometry, ...), st_union(geometry),
+# etc.) works without further changes.
+if ("SHAPE" %in% names(bua) && !("geometry" %in% names(bua))) {
+
+  names(bua)[names(bua) == "SHAPE"] <- "geometry"
+  st_geometry(bua) <- "geometry"
+
+  cat("Renamed geometry column: SHAPE -> geometry\n")
+}
+
+# Check the input
+stopifnot(
+  inherits(bua, "sf"),
+  nrow(bua) > 0,
+  st_crs(bua)$epsg == 27700
+)
+
+cat("Input BUAs:", nrow(bua), "\n")
+cat("CRS: EPSG", st_crs(bua)$epsg, "\n")
+cat("Cores available for parallel step:", n_cores, "\n")
+
+# Helper functions
+
+report_object <- function(x, label) {
+
+  cat("\n", label, "\n", sep = "")
+  cat("Features:", nrow(x), "\n")
+
+  cat(
+    "Object size:",
+    round(as.numeric(object.size(x)) / 1024^2, 1),
+    "MB\n"
+  )
+}
+
+fill_polygon_holes <- function(x) {
+
+  input_crs <- st_crs(x)
+
+  x <- st_make_valid(x)
+
+  filled <- lapply(st_geometry(x), function(g) {
+
+    polygon_parts <- st_cast(
+      st_sfc(g, crs = input_crs),
+      "POLYGON",
+      warn = FALSE
+    )
+
+    exterior_only <- lapply(
+      polygon_parts,
+      function(p) st_polygon(list(p[[1]]))
+    )
+
+    # The parts came from casting a single valid feature, so they
+    # are already disjoint by construction. st_combine() just
+    # aggregates them into one geometry without running a GEOS
+    # dissolve, which is what st_union() would do unnecessarily.
+    st_combine(
+      st_sfc(
+        exterior_only,
+        crs = input_crs
+      )
+    )[[1]]
+  })
+
+  st_set_geometry(
+    x,
+    st_sfc(
+      filled,
+      crs = input_crs
+    )
+  )
+}
+
+# Start overall timer
+
+overall_start <- Sys.time()
+
+cat("\nOverall start time:", format(overall_start), "\n")
+
+# Step 0: input diagnostics (vertex density)
+
+cat("\n============================================\n")
+cat("STEP 0 — Input geometry diagnostics\n")
+cat("============================================\n")
+
+step0_start <- Sys.time()
+
+t0 <- system.time({
+
+  vertex_counts <- sapply(
+    st_geometry(bua),
+    function(g) sum(lengths(g)) / 2
+  )
+
+})
+
+step0_end <- Sys.time()
+
+print(t0)
+
+cat("Started:", format(step0_start), "\n")
+cat("Finished:", format(step0_end), "\n")
+
+cat("\nVertex count per BUA:\n")
+print(summary(vertex_counts))
+
+cat("\nTop 10 most detailed BUAs:\n")
+print(sort(vertex_counts, decreasing = TRUE)[1:10])
+
+vertex_diagnostics <- list(
+  vertex_counts = vertex_counts,
+  summary = summary(vertex_counts)
+)
+
+saveRDS(
+  vertex_diagnostics,
+  file.path(
+    checkpoint_dir,
+    "00_vertex_diagnostics.rds"
+  )
+)
+
+rm(vertex_counts, vertex_diagnostics)
+
+if (!is.null(simplify_tolerance)) {
+
+  cat(
+    "\nSimplifying input geometries with dTolerance =",
+    simplify_tolerance,
+    "m\n"
+  )
+
+  bua <- st_simplify(
+    bua,
+    dTolerance = simplify_tolerance,
+    preserveTopology = TRUE
+  )
+
+  bua <- st_make_valid(bua)
+
+  cat("Simplification complete.\n")
+
+} else {
+
+  cat("\nsimplify_tolerance is NULL — skipping simplification.\n")
+}
+
+# Step 1: fixed link-buffer distance (for grouping only)
+
+cat("\n============================================\n")
+cat("STEP 1 — Fixed link-buffer distance for grouping\n")
+cat("============================================\n")
+
+step1_start <- Sys.time()
+
+t1 <- system.time({
+
+  # This distance decides only whether two BUAs count as the same urban
+  # area (Steps 2-3); it does not scale with area. ONS's BUA22
+  # methodology treats built-up areas 200 m or less apart as one
+  # settlement, so buffering each BUA outwards by half that distance and
+  # testing for overlap reproduces the same 200 m rule. The closing
+  # distance for each group is calculated separately in Step 4 as
+  # coefficient * sqrt(group area).
+  link_buffer_m <- 100
+
+})
+
+step1_end <- Sys.time()
+
+print(t1)
+
+cat("Started:", format(step1_start), "\n")
+cat("Finished:", format(step1_end), "\n")
+
+cat(
+  "Link-buffer distance (grouping only):",
+  link_buffer_m,
+  "m\n"
+)
+
+closing_parameters <- list(
+  coefficient = coefficient,
+  link_buffer_m = link_buffer_m
+)
+
+saveRDS(
+  closing_parameters,
+  file.path(
+    checkpoint_dir,
+    "01_closing_parameters.rds"
+  )
+)
+
+# Step 2: buffer each BUA outwards (for grouping only)
+
+cat("\n============================================\n")
+cat("STEP 2 — Buffer individual BUAs outwards (for grouping)\n")
+cat("============================================\n")
+
+step2_start <- Sys.time()
+
+t2 <- system.time({
+
+  # Buffered only to detect which BUAs are close enough to count as one
+  # urban area. These buffers feed the grouping in Step 3 only; Step 4
+  # re-buffers each group's original, unbuffered geometry by its own
+  # closing distance.
+  bua_buffered <- bua |>
+    transmute(
+      bua_row_id = row_number(),
+      geometry = st_buffer(
+        geometry,
+        dist = link_buffer_m
+      )
+    )
+
+})
+
+step2_end <- Sys.time()
+
+print(t2)
+
+cat("Started:", format(step2_start), "\n")
+cat("Finished:", format(step2_end), "\n")
+
+saveRDS(
+  bua_buffered,
+  file.path(
+    checkpoint_dir,
+    "02_bua_buffered.rds"
+  )
+)
+
+report_object(
+  bua_buffered,
+  "Buffered BUA object"
+)
+
+cat("Checkpoint saved.\n")
+
+# Step 3: identify connected buffer groups
+
+cat("\n============================================\n")
+cat("STEP 3 — Identify connected buffer groups\n")
+cat("============================================\n")
+
+step3_start <- Sys.time()
+
+t3 <- system.time({
+
+  buffer_neighbours <- st_intersects(
+    bua_buffered,
+    sparse = TRUE
+  )
+
+  buffer_graph <- graph_from_adj_list(
+    buffer_neighbours,
+    mode = "all"
+  )
+
+  bua_buffered$closing_group <- components(
+    buffer_graph
+  )$membership
+
+})
+
+step3_end <- Sys.time()
+
+print(t3)
+
+cat("Started:", format(step3_start), "\n")
+cat("Finished:", format(step3_end), "\n")
+
+group_sizes <- table(bua_buffered$closing_group)
+
+cat(
+  "Connected groups:",
+  n_distinct(bua_buffered$closing_group),
+  "\n"
+)
+
+cat("\nGroup size distribution:\n")
+print(summary(as.integer(group_sizes)))
+
+cat("\nTop 10 largest groups (by BUA count):\n")
+print(sort(group_sizes, decreasing = TRUE)[1:10])
+
+saveRDS(
+  group_sizes,
+  file.path(
+    checkpoint_dir,
+    "03b_group_size_diagnostics.rds"
+  )
+)
+
+saveRDS(
+  bua_buffered,
+  file.path(
+    checkpoint_dir,
+    "03_bua_buffered_grouped.rds"
+  )
+)
+
+rm(
+  buffer_neighbours,
+  buffer_graph,
+  group_sizes
+)
+
+gc()
+
+report_object(
+  bua_buffered,
+  "Grouped buffered BUAs"
+)
+
+cat("Checkpoint saved.\n")
+
+# Step 3b: attach groups to original (unbuffered) geometry
+
+cat("\n============================================\n")
+cat("STEP 3B — Attach groups to original geometry\n")
+cat("============================================\n")
+
+# Step 4 closes each group from its original geometry using its own
+# area-scaled buffer distance, not the link-buffered version used only
+# for grouping above.
+bua_grouped <- bua |>
+  transmute(
+    bua_row_id = row_number(),
+    closing_group = bua_buffered$closing_group,
+    geometry = geometry
+  )
+
+saveRDS(
+  bua_grouped,
+  file.path(
+    checkpoint_dir,
+    "03c_bua_grouped_raw.rds"
+  )
+)
+
+cat("Checkpoint saved.\n")
+
+# Step 4: process each group separately (in parallel)
+
+cat("\n============================================\n")
+cat("STEP 4 — Close each connected group\n")
+cat("============================================\n")
+
+group_ids <- sort(
+  unique(bua_grouped$closing_group)
+)
+
+group_output_dir <- file.path(
+  checkpoint_dir,
+  "closed_groups"
+)
+
+dir.create(
+  group_output_dir,
+  showWarnings = FALSE
+)
+
+# Split row indices by group once, rather than re-filtering the full
+# bua_grouped object in every iteration, so lookup by group id is fast.
+group_row_indices <- split(
+  seq_len(nrow(bua_grouped)),
+  bua_grouped$closing_group
+)
+
+process_one_group <- function(group_id) {
+
+  output_file <- file.path(
+    group_output_dir,
+    paste0(
+      "closed_group_",
+      sprintf("%05d", group_id),
+      ".rds"
+    )
+  )
+
+  # Skip groups already completed (resumable across runs)
+  if (file.exists(output_file)) {
+    return(invisible(NULL))
+  }
+
+  idx <- group_row_indices[[as.character(group_id)]]
+
+  group_raw <- bua_grouped[idx, ]
+
+  # Merge this group's original (unbuffered) BUAs, then compute a closing
+  # distance scaled to this group's own area (coefficient * sqrt(area)).
+  group_original <- st_union(st_geometry(group_raw))
+
+  group_area_m2 <- as.numeric(st_area(group_original))
+
+  group_buffer_m <- coefficient * sqrt(group_area_m2)
+
+  group_closed_geom <-
+    group_original |>
+    st_buffer(group_buffer_m) |>
+    st_union() |>
+    st_buffer(-group_buffer_m)
+
+  group_closed <- st_sf(
+    closing_group = group_id,
+    bua_count = nrow(group_raw),
+    buffer_m = group_buffer_m,
+    geometry = group_closed_geom
+  ) |>
+    st_make_valid()
+
+  group_closed <- group_closed[
+    !st_is_empty(group_closed),
+  ]
+
+  saveRDS(
+    group_closed,
+    output_file
+  )
+
+  invisible(NULL)
+}
+
+step4_start <- Sys.time()
+
+t4 <- system.time({
+
+  # mclapply forks the process on Unix and Mac, so bua_buffered and
+  # group_row_indices are shared copy-on-write rather than duplicated per
+  # worker. On Windows it runs serially.
+  invisible(
+    parallel::mclapply(
+      group_ids,
+      process_one_group,
+      mc.cores = n_cores
+    )
+  )
+
+})
+
+step4_end <- Sys.time()
+
+print(t4)
+
+cat("Started:", format(step4_start), "\n")
+cat("Finished:", format(step4_end), "\n")
+
+completed <- sum(
+  file.exists(
+    file.path(
+      group_output_dir,
+      paste0(
+        "closed_group_",
+        sprintf("%05d", group_ids),
+        ".rds"
+      )
+    )
+  )
+)
+
+cat(
+  "Groups completed:",
+  completed,
+  "/",
+  length(group_ids),
+  "\n"
+)
+
+rm(bua_buffered, bua_grouped, group_row_indices)
+gc()
+
+# Step 5: combine completed groups
+
+cat("\n============================================\n")
+cat("STEP 5 — Combine closed groups\n")
+cat("============================================\n")
+
+step5_start <- Sys.time()
+
+t5 <- system.time({
+
+  group_files <- list.files(
+    group_output_dir,
+    pattern = "\\.rds$",
+    full.names = TRUE
+  )
+
+  closed_group_list <- lapply(
+    group_files,
+    readRDS
+  )
+
+  urban_closed <- do.call(
+    rbind,
+    closed_group_list
+  )
+
+  urban_closed <- st_make_valid(
+    urban_closed
+  )
+
+  urban_closed <- urban_closed[
+    !st_is_empty(urban_closed),
+  ]
+
+})
+
+step5_end <- Sys.time()
+
+print(t5)
+
+cat("Started:", format(step5_start), "\n")
+cat("Finished:", format(step5_end), "\n")
+
+saveRDS(
+  urban_closed,
+  file.path(
+    checkpoint_dir,
+    "05_urban_closed.rds"
+  )
+)
+
+rm(
+  closed_group_list
+)
+
+gc()
+
+report_object(
+  urban_closed,
+  "Combined closed urban geometry"
+)
+
+cat("Checkpoint saved.\n")
+
+# Step 6: fill enclosed holes
+
+cat("\n============================================\n")
+cat("STEP 6 — Fill enclosed holes\n")
+cat("============================================\n")
+
+step6_start <- Sys.time()
+
+t6 <- system.time({
+
+  urban_filled <- fill_polygon_holes(
+    urban_closed
+  )
+
+  urban_filled <- st_make_valid(
+    urban_filled
+  )
+
+})
+
+step6_end <- Sys.time()
+
+print(t6)
+
+cat("Started:", format(step6_start), "\n")
+cat("Finished:", format(step6_end), "\n")
+
+saveRDS(
+  urban_filled,
+  file.path(
+    checkpoint_dir,
+    "06_urban_holes_filled.rds"
+  )
+)
+
+report_object(
+  urban_filled,
+  "Hole-filled urban geometry"
+)
+
+cat("Checkpoint saved.\n")
+
+# Step 7: split into individual urban regions
+
+cat("\n============================================\n")
+cat("STEP 7 — Create final urban-region polygons\n")
+cat("============================================\n")
+
+step7_start <- Sys.time()
+
+t7 <- system.time({
+
+  # Cast row by row. Casting the whole urban_filled object at once can
+  # silently drop parts of very large multipart groups (London, for
+  # example, came out as a small fragment). Expanding each row
+  # independently keeps every part.
+  urban_regions_list <- lapply(
+    seq_len(nrow(urban_filled)),
+    function(i) {
+      st_cast(
+        urban_filled[i, ],
+        "POLYGON",
+        warn = FALSE
+      )
+    }
+  )
+
+  urban_regions <- do.call(rbind, urban_regions_list)
+
+  urban_regions <- st_make_valid(urban_regions)
+
+  urban_regions <- urban_regions[
+    !st_is_empty(urban_regions),
+  ]
+
+  # Compute area once and reuse it for the sort key and for area_ha.
+  area_m2 <- as.numeric(st_area(urban_regions$geometry))
+
+  urban_regions <- urban_regions |>
+    mutate(area_m2 = area_m2) |>
+    arrange(desc(area_m2)) |>
+    mutate(
+      urban_region_id = row_number(),
+      area_ha = area_m2 / 10000
+    ) |>
+    select(
+      urban_region_id,
+      closing_group,
+      bua_count,
+      area_ha,
+      geometry
+    )
+
+})
+
+step7_end <- Sys.time()
+
+print(t7)
+
+cat("Started:", format(step7_start), "\n")
+cat("Finished:", format(step7_end), "\n")
+
+saveRDS(
+  urban_regions,
+  file.path(
+    checkpoint_dir,
+    "07_urban_regions_final.rds"
+  )
+)
+
+st_write(
+  urban_regions,
+  file.path(
+    checkpoint_dir,
+    "urban_regions_final.gpkg"
+  ),
+  layer = "urban_regions",
+  delete_layer = TRUE,
+  quiet = TRUE
+)
+
+report_object(
+  urban_regions,
+  "Final urban regions"
+)
+
+# Timing summary
+
+overall_end <- Sys.time()
+
+timings <- rbind(
+  input_diagnostics = t0,
+  closing_distance = t1,
+  outward_buffer = t2,
+  connected_groups = t3,
+  group_closing = t4,
+  combine_groups = t5,
+  hole_filling = t6,
+  final_regions = t7
+)
+
+cat("\n============================================\n")
+cat("COMPLETE\n")
+cat("============================================\n")
+
+cat("Overall start:", format(overall_start), "\n")
+cat("Overall finish:", format(overall_end), "\n")
+
+cat(
+  "Overall elapsed time:",
+  round(
+    as.numeric(
+      difftime(
+        overall_end,
+        overall_start,
+        units = "mins"
+      )
+    ),
+    2
+  ),
+  "minutes\n"
+)
+
+cat(
+  "Final urban regions:",
+  nrow(urban_regions),
+  "\n"
+)
+
+cat(
+  "Total final area:",
+  round(sum(urban_regions$area_ha), 1),
+  "ha\n"
+)
+
+cat("\nIndividual timings:\n")
+print(timings)
+
+saveRDS(
+  timings,
+  file.path(
+    checkpoint_dir,
+    "08_processing_timings.rds"
+  )
+)
+
+# Quick visual check
+
+plot(
+  st_geometry(urban_regions),
+  col = "grey70",
+  border = "black",
+  main = paste(
+    nrow(urban_regions),
+    "derived urban regions"
+  )
+)
+
+```
+
+# Plot London to check the build.
+
+Checks the intermediate objects from Steps 5 and 6 (`urban_closed`,
+`urban_filled`) straight after a build, before Step 7 splits them into
+final regions. Run it immediately after the build chunk above; it cannot
+be run on its own.
+
+```{r london_diagnostic_plot}
+london_bbox <- st_bbox(
+  c(xmin = 500000, ymin = 145000, xmax = 570000, ymax = 210000),
+  crs = st_crs(urban_regions)
+)
+
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+
+plot(st_geometry(st_crop(bua, london_bbox)), col = "grey70", border = "black", main = "Raw BUAs (this run)")
+plot(st_geometry(st_crop(urban_closed, london_bbox)), col = "grey70", border = "black", main = "After closing (Step 5)")
+plot(st_geometry(st_crop(urban_filled, london_bbox)), col = "grey70", border = "black", main = "After hole-fill (Step 6)")
+
+par(mfrow = c(1, 1))
+```

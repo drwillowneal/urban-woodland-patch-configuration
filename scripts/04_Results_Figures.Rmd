@@ -1,0 +1,1174 @@
+---
+title: "04 Tables and figures"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+Generates the manuscript's tables and figures from the saved national
+results. Each section is labelled with the manuscript item it produces.
+Sections marked "not used in the manuscript" are additional figures kept
+for reference.
+
+| Manuscript item | Chunk | Output file in `figures/` |
+|---|---|---|
+| Figure 1 | `results_fig1_structure_revised` | `Fig01_woodland_structure.png` |
+| Table 1 | `results_descriptives` | `Table1_descriptives.csv` |
+| Figure 2a | `results_fig2a_threshold_sweep` | `Fig_dispersal_curve_national.png` |
+| Figure 2b | `results_fig2b_threshold_ridgeline` | `Fig_dispersal_ridgeline_national.png` |
+| Figure 3 | `results_fig3_named_cities_two_readings` | `Fig04d_two_readings_named_cities.png` |
+| Figure 4 | `results_fig3_map` | `Fig03_connectivity_map.png` |
+| Figures 5 and 6 | `sloss_publication_figures` | `Fig05_area_vs_fragmentation.png`, `Fig06_matched_pairs.png` |
+| Figure 7 | `results_fig7_spacing_partial_plot` | `Fig_SLOSS_spacing_partial_effect.png` |
+| Supplementary Table 1 | `city_set_and_constituents` | `TableS1_city_constituents.csv` |
+| Supplementary Figure 1 and Table 2 | `sloss_publication_figures` | `Fig07_effect_across_city_size.png`, `Supp_woodland_amount_band_effects.csv` |
+| Supplementary Table 3 | `results_supp_table2_top_patch_regions` | `TableS_spacing_top_patch_count_regions.csv` |
+| Supplementary Table 4 | `results_supp_table4_city_connectivity` | `SuppTable4_city_connectivity.csv` |
+
+Table 2, Supplementary Table 5 and Supplementary Figure 2 are produced in
+`03_National_ECS.Rmd`.
+
+# Setup
+
+```{r setup}
+source(here::here("scripts", "00_setup.R"))
+# patchwork is used by several figure chunks below. Loading it once here
+# means the chunks do not depend on the order they are run in.
+library(patchwork)
+```
+
+Loads the named urban regions and the clipped NFI woodland polygons saved by `01b`.
+
+```{r load_checkpoints}
+library(sf)
+
+urban_regions_named <- readRDS(
+  file.path(checkpoint_dir, "07b_urban_regions_named.rds")
+)
+
+nfi_urban <- readRDS(
+  file.path(checkpoint_dir, "nfi_urban_regions.rds")
+)
+
+cat("urban_regions_named:", nrow(urban_regions_named), "regions\n")
+```
+
+# Named-region data prep (needed for the delineation figure below)
+
+```{r prepare_bua_data}
+# Filter to England using the LSOA-to-Region lookup rather than the
+# census population table. LSOAs cover the whole country without gaps,
+# whereas the census table's BUA22 codes do not match for central London,
+# so a semi_join against it would drop inner London from `bua`.
+england_buas <- lsoa_lookup |>
+  filter(startsWith(RGN22CD, "E12")) |>
+  distinct(BUA22CD)
+
+bua <- bua |>
+  semi_join(england_buas, by = "BUA22CD")
+
+# Add population counts and names. A left_join keeps any BUA missing from
+# the census population table, with population = NA.
+bua <- bua |>
+  left_join(
+    census |>
+      dplyr::select(
+        BUA22CD = `BUA code`,
+        population = Counts,
+        size_classification = `BUA size classification`
+      ),
+    by = "BUA22CD"
+  )
+```
+
+# Results data prep
+
+Loads the national results, keeps the regions that were modelled successfully, and defines the figure-saving helper and the size-adjustment model used by the figures below.
+
+```{r fit_residual_models}
+library(ggplot2)
+if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel", repos = "https://cloud.r-project.org")
+library(ggrepel)
+
+# Figures are written here as well as shown in the plot pane. The folder
+# is in the project, not on the checkpoint drive, because these are small
+# outputs that belong with the manuscript.
+figures_dir <- here::here("figures")
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+save_fig <- function(plot_obj, name, width = 9, height = 6.5) {
+  ggsave(file.path(figures_dir, paste0(name, ".png")),
+         plot_obj, width = width, height = height, dpi = 300)
+  invisible(plot_obj)
+}
+
+# Defined here as well as in the national_loop chunk of
+# 03_National_ECS.Rmd, so the analysis and figure chunks below can be run
+# without re-running the national build.
+results_path <- file.path(checkpoint_dir, "08_national_ecs_results.csv")
+
+results <- read.csv(results_path, stringsAsFactors = FALSE)
+ok <- results |> filter(is.na(error), total_area_ha > 0)
+ok$log_area <- log(ok$total_area_ha)
+
+fit_residuals <- function(pct_col) {
+  sub <- ok |> filter(!is.na(.data[[pct_col]]))
+  fit <- lm(reformulate("log_area", response = pct_col), data = sub)
+  sub$predicted <- predict(fit)
+  sub$residual <- sub[[pct_col]] - sub$predicted
+  list(data = sub, fit = fit)
+}
+
+res_59 <- fit_residuals("ECS_pct_59")
+res_99 <- fit_residuals("ECS_pct_99")
+res_512 <- fit_residuals("ECS_pct_512")
+
+cat("ECS_pct_59 model R-squared:", round(summary(res_59$fit)$r.squared, 3), "\n")
+cat("ECS_pct_99 model R-squared:", round(summary(res_99$fit)$r.squared, 3), "\n")
+cat("ECS_pct_512 model R-squared:", round(summary(res_512$fit)$r.squared, 3), "\n")
+```
+
+# Figure 1: extent and patch structure
+
+Plots the distribution of woodland cover and of area-weighted patch size across regions. It needs `10_patch_size_distribution.csv` from `03b`.
+
+```{r results_fig1_structure_revised}
+patch_path <- file.path(checkpoint_dir, "10_patch_size_distribution.csv")
+stopifnot(file.exists(patch_path))
+
+ps <- read.csv(patch_path, stringsAsFactors = FALSE) |> filter(is.na(error))
+
+# The patch-size pass processes regions in the same smallest-first order
+# as the national run, so a partial file is biased towards small regions.
+# Warn rather than report a skewed distribution.
+is_partial <- nrow(ps) < nrow(ok)
+if (is_partial) {
+  warning("Patch-size file is incomplete (", nrow(ps), " of ", nrow(ok),
+          " regions). Figure 1 is PRELIMINARY and biased towards small regions.")
+}
+
+fig1_dat <- ok |>
+  mutate(woodland_pct = 100 * total_area_ha / area_ha) |>
+  inner_join(ps |> dplyr::select(region, awm_patch_ha, largest_patch_ha, mean_patch_ha),
+             by = "region")
+
+p1a <- ggplot(fig1_dat, aes(x = woodland_pct)) +
+  geom_histogram(bins = 50, fill = "grey45", colour = NA) +
+  geom_vline(xintercept = median(fig1_dat$woodland_pct), colour = "firebrick", linewidth = 0.9) +
+  annotate("text", x = median(fig1_dat$woodland_pct), y = Inf, vjust = 1.8, hjust = -0.12,
+           label = sprintf("median %.1f%%", median(fig1_dat$woodland_pct)),
+           colour = "firebrick", fontface = "bold", size = 3.6) +
+  labs(x = "Woodland cover (% of region area)", y = "Number of regions") +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(face = "bold"))
+
+med_awm <- median(fig1_dat$awm_patch_ha)
+p1b <- ggplot(fig1_dat, aes(x = awm_patch_ha)) +
+  geom_histogram(bins = 50, fill = "steelblue4", colour = NA) +
+  geom_vline(xintercept = med_awm, colour = "firebrick", linewidth = 0.9) +
+  annotate("text", x = med_awm, y = Inf, vjust = 1.8, hjust = -0.12,
+           label = sprintf("median %.2f ha", med_awm),
+           colour = "firebrick", fontface = "bold", size = 3.6) +
+  scale_x_log10() +
+  # The y-axis label is repeated on both panels so it is clear that the
+  # bars count regions; without it, the x-axis (a within-region statistic)
+  # can be misread as showing patches or a single region.
+  labs(x = "Typical patch size within a region (ha, log scale)",
+       y = "Number of regions") +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(face = "bold", size = 11))
+
+# The figure describes regions, not woodland in aggregate: the pooled
+# national figure differs substantially from the region-wise median, so a
+# statement about "England's urban woodland" would be a different claim
+# from one about the typical urban area. Each region contributes one
+# observation to each panel, and bars count regions. Panel (b) is
+# area-weighted within each region, so it is not dragged down by large
+# numbers of tiny fragments: it reports the patch size that a typical
+# hectare of the region's woodland sits in.
+fig1 <- (p1a | p1b) +
+  plot_annotation(
+    theme = theme(plot.title = element_text(face = "bold", size = 14),
+                  plot.subtitle = element_text(size = 9.5, lineheight = 1.15)))
+print(fig1)
+save_fig(fig1, "Fig01_woodland_structure", width = 11.5, height = 5.4)
+
+cat("\n--- Panel (b) summary ---\n")
+cat(sprintf("  area-weighted mean patch size: median %.3f ha (IQR %.3f-%.3f, max %.1f)\n",
+            median(fig1_dat$awm_patch_ha), quantile(fig1_dat$awm_patch_ha, .25),
+            quantile(fig1_dat$awm_patch_ha, .75), max(fig1_dat$awm_patch_ha)))
+cat(sprintf("  count-based mean for comparison: median %.3f ha\n", median(fig1_dat$mean_patch_ha)))
+cat(sprintf("  largest patch per region: median %.2f ha, max %.1f ha\n",
+            median(fig1_dat$largest_patch_ha), max(fig1_dat$largest_patch_ha)))
+cat(sprintf("  regions containing at least one patch >= 1 ha:  %.1f%%\n",
+            100 * mean(fig1_dat$largest_patch_ha >= 1)))
+cat(sprintf("  regions containing at least one patch >= 10 ha: %.1f%%\n",
+            100 * mean(fig1_dat$largest_patch_ha >= 10)))
+```
+
+# Table 1: descriptive statistics
+
+Calculates the descriptive statistics quoted in the Results and writes Table 1 as a CSV.
+
+```{r results_descriptives}
+library(tibble)
+library(tidyr)
+
+desc <- ok |>
+  mutate(woodland_pct = 100 * total_area_ha / area_ha,
+         mean_patch_ha = total_area_ha / n_patches)
+
+# Join the patch-size distribution, which supplies the area-weighted mean
+# patch size. The count-based mean above treats a 0.05 ha scrap and a
+# 40 ha wood as equal observations and understates the patch size
+# experienced by woodland; the area-weighted version is ECS evaluated at
+# a threshold of zero, and is the figure reported.
+patch_path <- file.path(checkpoint_dir, "10_patch_size_distribution.csv")
+if (file.exists(patch_path)) {
+  ps_all <- read.csv(patch_path, stringsAsFactors = FALSE) |> filter(is.na(error))
+  desc <- desc |> left_join(ps_all |> dplyr::select(region, awm_patch_ha, largest_patch_ha),
+                            by = "region")
+  if (nrow(ps_all) < nrow(ok)) {
+    warning("Patch-size file incomplete (", nrow(ps_all), " of ", nrow(ok),
+            " regions) -- area-weighted figures are PRELIMINARY.", call. = FALSE)
+  }
+} else {
+  desc$awm_patch_ha <- NA_real_; desc$largest_patch_ha <- NA_real_
+  warning("10_patch_size_distribution.csv not found; area-weighted patch size unavailable.",
+          call. = FALSE)
+}
+
+qr <- function(x) sprintf("median %.3f (IQR %.3f-%.3f, max %.2f)",
+                          median(x, na.rm = TRUE), quantile(x, .25, na.rm = TRUE),
+                          quantile(x, .75, na.rm = TRUE), max(x, na.rm = TRUE))
+
+cat("Regions modelled:", nrow(desc), "\n")
+cat("Total urban area:", format(round(sum(desc$area_ha)), big.mark = ","), "ha\n")
+cat("Total urban woodland:", format(round(sum(desc$total_area_ha)), big.mark = ","), "ha\n")
+cat("Woodland as % of urban land:", round(100 * sum(desc$total_area_ha) / sum(desc$area_ha), 2), "%\n\n")
+cat("Woodland cover (%):      ", qr(desc$woodland_pct), "\n")
+cat("Patches per region:      ", qr(desc$n_patches), "\n")
+cat("Mean patch size (ha):    ", qr(desc$mean_patch_ha), "\n")
+cat("  regions with mean patch < 1 ha:  ", round(100 * mean(desc$mean_patch_ha < 1), 1), "%\n")
+cat("  regions with mean patch < 0.5 ha:", round(100 * mean(desc$mean_patch_ha < 0.5), 1), "%\n\n")
+
+for (th in c(59, 99, 512)) {
+  v <- desc[[paste0("ECS_pct_", th)]]
+  cat(sprintf("%3dm: median %.3f | mean %.3f | %%>=50%% connected: %.1f%%\n",
+              th, median(v, na.rm = TRUE), mean(v, na.rm = TRUE),
+              100 * mean(v >= 0.5, na.rm = TRUE)))
+}
+
+# Regions with relative ECS of at least 0.5 at 512 m but not at 59 m
+# (quoted in the Results).
+both <- desc |> filter(!is.na(ECS_pct_59), !is.na(ECS_pct_512))
+sorted_n <- sum(both$ECS_pct_512 >= 0.5 & both$ECS_pct_59 < 0.5)
+cat(sprintf("\nConnected for a 512m disperser but NOT a 59m disperser: %d of %d (%.1f%%)\n",
+            sorted_n, nrow(both), 100 * sorted_n / nrow(both)))
+
+# Table 1, formatted for the manuscript
+# Reported as median / IQR / range rather than mean +- SD, because every
+# variable here is strongly right-skewed and a mean would misrepresent
+# the typical region.
+fmt <- function(x, dp = 2, big = FALSE) {
+  f <- function(v) if (big) format(round(v, dp), big.mark = ",", trim = TRUE) else sprintf(paste0("%.", dp, "f"), v)
+  c(median = f(median(x, na.rm = TRUE)),
+    iqr    = paste0(f(quantile(x, .25, na.rm = TRUE)), "–", f(quantile(x, .75, na.rm = TRUE))),
+    range  = paste0(f(min(x, na.rm = TRUE)), "–", f(max(x, na.rm = TRUE))))
+}
+
+# Rows are grouped under subheadings because they are in different units
+# (percentages, hectares, counts) and are not meant to be compared with
+# one another. The table is a reference of exact values; comparisons
+# between the three movement thresholds are made in Figure 2, where they
+# share a common scale.
+vars <- list(
+  "__EXTENT" = NULL,
+  "Woodland cover (% of region area)"        = fmt(desc$woodland_pct, 2),
+  "Total woodland per region (ha)"           = fmt(desc$total_area_ha, 2, big = TRUE),
+  "__STRUCTURE" = NULL,
+  "Woodland patches per region"              = fmt(desc$n_patches, 0, big = TRUE),
+  "Typical patch size, area-weighted (ha)"   = fmt(desc$awm_patch_ha, 3),
+  "Largest patch in region (ha)"             = fmt(desc$largest_patch_ha, 2),
+  "__CONNECTIVITY" = NULL,
+  "Woodland accessible at 59 m (%)"          = fmt(100 * desc$ECS_pct_59, 1),
+  "Woodland accessible at 99 m (%)"          = fmt(100 * desc$ECS_pct_99, 1),
+  "Woodland accessible at 512 m (%)"         = fmt(100 * desc$ECS_pct_512, 1)
+)
+
+group_labels <- c("__EXTENT" = "Extent", "__STRUCTURE" = "Structure",
+                  "__CONNECTIVITY" = "Connectivity")
+
+grab <- function(v, field) if (is.null(v)) "" else unname(v[[field]])
+
+tab1 <- tibble::tibble(
+  Variable = ifelse(names(vars) %in% names(group_labels),
+                    unname(group_labels[names(vars)]), names(vars)),
+  Median   = vapply(vars, grab, character(1), "median"),
+  IQR      = vapply(vars, grab, character(1), "iqr"),
+  Range    = vapply(vars, grab, character(1), "range")
+)
+
+cat("\n--- Table 1 ---\n")
+print(as.data.frame(tab1), row.names = FALSE)
+cat("\nn =", nrow(desc), "urban regions\n")
+
+# A file can be briefly locked by a file-sync client or by being open in
+# Excel. Do not let that abort the chunk; the table is printed above
+# regardless.
+tryCatch(
+  write.csv(tab1, file.path(figures_dir, "Table1_descriptives.csv"), row.names = FALSE),
+  error = function(e) warning("Could not write Table1_descriptives.csv (file locked?): ",
+                              conditionMessage(e), call. = FALSE)
+)
+```
+
+# Figures 2a and 2b: connectivity across movement thresholds
+
+Both panels use the national movement-threshold sweep (relative ECS for
+every region at every 10 m from 0 to 1,000 m), computed in the
+`threshold_sweep_loop` and `threshold_sweep_extend_loop` chunks of
+`03_National_ECS.Rmd`. The plotting code is the same as in the
+`plot_threshold_sweep` and `plot_threshold_ridgeline` chunks there. The
+three percentages marked on Figure 2a are calculated from the results.
+
+```{r results_fig2a_threshold_sweep}
+prior_sweep <- read.csv(file.path(checkpoint_dir, "08_national_ecs_threshold_sweep.csv"), stringsAsFactors = FALSE)
+
+sweep_summary <- prior_sweep |>
+  filter(!is.na(ECS_pct)) |>
+  group_by(threshold_m) |>
+  summarise(
+    median_pct = median(ECS_pct),
+    q25 = quantile(ECS_pct, 0.25),
+    q75 = quantile(ECS_pct, 0.75),
+    pct_above_50 = 100 * mean(ECS_pct >= 0.5),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Share of regions with relative ECS >= 0.5 at the three focal thresholds,
+# calculated from the national results.
+marker_thresholds <- data.frame(
+  threshold_m = c(59, 99, 512),
+  label = c("59m", "99m", "512m"),
+  pct = round(100 * c(mean(ok$ECS_pct_59 >= 0.5, na.rm = TRUE),
+                      mean(ok$ECS_pct_99 >= 0.5, na.rm = TRUE),
+                      mean(ok$ECS_pct_512 >= 0.5, na.rm = TRUE)), 1)
+)
+
+fig_dispersal_curve <- ggplot(sweep_summary, aes(x = threshold_m, y = pct_above_50)) +
+  geom_line(colour = "firebrick", linewidth = 1.1) +
+  geom_hline(yintercept = 50, linetype = "dotted", colour = "grey50") +
+  geom_point(data = marker_thresholds, aes(x = threshold_m, y = pct), colour = "grey20", size = 2.5) +
+  ggrepel::geom_label_repel(data = marker_thresholds, aes(x = threshold_m, y = pct, label = paste0(label, ": ", pct, "%")),
+                             colour = "grey20", size = 3.3, label.size = 0, fill = alpha("white", 0.85),
+                             min.segment.length = 0, box.padding = 0.6, seed = 1) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 100), breaks = seq(0, 100, 25)) +
+  scale_x_continuous(breaks = seq(0, 1000, 100)) +
+  labs(
+    x = "Movement threshold (m)",
+    y = "Regions functioning as a connected network (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 13.5),
+        plot.subtitle = element_text(size = 9.5, lineheight = 1.2))
+print(fig_dispersal_curve)
+save_fig(fig_dispersal_curve, "Fig_dispersal_curve_national", width = 10, height = 7)
+
+tryCatch(
+  write.csv(sweep_summary, file.path(figures_dir, "TableS_dispersal_curve_summary.csv"), row.names = FALSE),
+  error = function(e) warning("Could not write TableS_dispersal_curve_summary: ", conditionMessage(e), call. = FALSE)
+)
+```
+
+The sweep only has rows at multiples of 10 m, so 59 m and 99 m are
+shown by their nearest sweep values, 60 m and 100 m.
+
+```{r results_fig2b_threshold_ridgeline}
+if (!requireNamespace("ggridges", quietly = TRUE)) install.packages("ggridges", repos = "https://cloud.r-project.org")
+library(ggridges)
+
+selected_thresholds <- sort(unique(c(seq(0, 1000, by = 100), 60, 512)))
+ridge_dat <- prior_sweep |> filter(!is.na(ECS_pct), threshold_m %in% selected_thresholds)
+ridge_dat$threshold_label <- factor(paste0(ridge_dat$threshold_m, "m"),
+                                     levels = paste0(rev(selected_thresholds), "m"))
+
+fig_dispersal_ridgeline <- ggplot(ridge_dat, aes(x = ECS_pct, y = threshold_label, fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 2.2, rel_min_height = 0.01, colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "inferno", name = "Connectivity", labels = scales::percent, guide = "none") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    x = "Expected Cluster Size (%)",
+    y = "Movement threshold"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(size = 9.5, lineheight = 1.2))
+print(fig_dispersal_ridgeline)
+save_fig(fig_dispersal_ridgeline, "Fig_dispersal_ridgeline_national", width = 10, height = 8.5)
+```
+
+# Figure 4: geography of connectivity
+
+```{r results_fig3_map}
+# Fill is the percentile rank of ECS_pct_59, not the raw value. Most
+# regions sit in a narrow band, so a linear scale would spend most of the
+# viridis gradient on a range almost nothing occupies and show only
+# extreme outliers (for example Milton Keynes). Percentile rank spends
+# the full colour range on the actual distribution, whatever its shape.
+map_conn <- urban_regions_named |>
+  inner_join(desc |> dplyr::select(region, ECS_pct_59, ECS_pct_99),
+             by = c("bua_name" = "region")) |>
+  mutate(pct_rank_59 = dplyr::percent_rank(ECS_pct_59))
+
+fig_map <- ggplot(map_conn) +
+  geom_sf(aes(fill = pct_rank_59), colour = NA) +
+  scale_fill_viridis_c(option = "viridis", labels = scales::percent,
+                       name = "Connectivity\npercentile\n(59 m)") +
+  theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "right")
+print(fig_map)
+save_fig(fig_map, "Fig03_connectivity_map", width = 9, height = 11)
+```
+
+# City set (Supplementary Table 1; also used by Figure 3 and Supplementary Table 4)
+
+Selects the regions that contain an ONS Major Town or City, and writes Supplementary Table 1 listing the designated places merged into each region.
+
+```{r city_set_and_constituents}
+library(sf)
+# dplyr is attached explicitly: if this chunk is run in a fresh session
+# without `setup`, filter() resolves to stats::filter() and fails on an
+# sf tibble. Attaching dplyr here puts it ahead of stats on the search
+# path.
+library(dplyr)
+
+tc <- readRDS(file.path(checkpoint_dir, "major_towns_cities.rds")) |> st_make_valid()
+tc$tcity_area <- as.numeric(st_area(tc))
+
+urb_valid <- st_make_valid(urban_regions_named)
+geoms <- urb_valid |> filter(bua_name %in% ok$region)
+
+inter <- suppressWarnings(
+  st_intersection(geoms |> dplyr::select(bua_name), tc |> dplyr::select(TCITY15NM, tcity_area)))
+inter$overlap <- as.numeric(st_area(inter))
+
+city_match <- st_drop_geometry(inter) |>
+  group_by(TCITY15NM) |>
+  slice_max(overlap, n = 1, with_ties = FALSE) |>
+  mutate(coverage = overlap / tcity_area) |>
+  ungroup() |>
+  filter(coverage >= 0.3)
+
+city_regions <- sort(unique(city_match$bua_name))
+cat("designated cities matched:", nrow(city_match), "of", nrow(tc), "\n")
+cat("distinct urban regions in the city set:", length(city_regions), "\n")
+cat("regions absorbing more than one designated city:",
+    sum(table(city_match$bua_name) > 1), "\n\n")
+
+# Supplementary Table 1: the designated places merged into each region.
+constituents <- city_match |>
+  group_by(Region = bua_name) |>
+  summarise(`Designated cities within region` = paste(sort(TCITY15NM), collapse = ", "),
+            n = n(), .groups = "drop") |>
+  left_join(ok |> dplyr::select(region, area_ha), by = c("Region" = "region")) |>
+  mutate(`Region area (ha)` = format(round(area_ha), big.mark = ",")) |>
+  dplyr::select(Region, `Designated cities within region`, n, `Region area (ha)`) |>
+  arrange(desc(n), Region)
+
+cat("--- regions containing more than one designated city ---\n")
+print(as.data.frame(constituents |> filter(n > 1) |> dplyr::select(-`Region area (ha)`)),
+      row.names = FALSE)
+
+tryCatch({
+  write.csv(constituents, file.path(figures_dir, "TableS1_city_constituents.csv"), row.names = FALSE)
+  library(officer)
+  read_docx() |>
+    body_add_par(paste0(
+      "Table S1. Urban regions used for between-city comparison, and the ONS-designated ",
+      "Major Towns and Cities each contains. Regions are delineated by continuity of built-up ",
+      "land, so several absorb more than one designated city; connectivity values reported ",
+      "against a region name describe the whole conurbation."), style = "Table Caption") |>
+    body_add_table(as.data.frame(constituents), style = "Table Professional", first_row = TRUE) |>
+    print(target = file.path(figures_dir, "TableS1_city_constituents.docx"))
+  cat("\nWrote TableS1_city_constituents.csv and .docx\n")
+}, error = function(e) warning("Could not write Table S1: ", conditionMessage(e), call. = FALSE))
+```
+
+# Figure 3: named cities, two readings of connectivity
+
+Reuses `ok` and `city_regions` from the city-set chunk above. Variable
+names carry a `_fig3` suffix so they do not overwrite the `cities`
+object used by the city figures below, and each panel has its own x-axis
+label.
+
+```{r results_fig3_named_cities_two_readings}
+library(mgcv)
+
+build_leaderboard_fig3 <- function(pct_col, floor_ha = 10) {
+  sub <- ok |> filter(total_area_ha >= floor_ha, area_ha > 0, !is.na(.data[[pct_col]]))
+  sub$log_area_region <- log(sub$area_ha)
+  sub$log_woodland <- log(sub$total_area_ha)
+  m <- gam(reformulate(c("s(log_area_region, k = 5)", "s(log_woodland, k = 5)"), response = pct_col),
+           data = sub, family = betar(link = "logit"), method = "REML")
+  sub$expected_pct <- predict(m, type = "response")
+  sub$divergence_pp <- 100 * (sub[[pct_col]] - sub$expected_pct)
+  sub
+}
+lb_59_fig3 <- build_leaderboard_fig3("ECS_pct_59")
+
+cities_fig3 <- ok |> filter(region %in% city_regions, area_ha > 0, !is.na(ECS_pct_59)) |>
+  left_join(lb_59_fig3 |> dplyr::select(region, expected_pct, divergence_pp), by = "region")
+
+cat("=== Divergence_pp for the named-places cities ===\n")
+print(cities_fig3 |> filter(region %in% c("Milton Keynes", "Manchester & Bolton (Bolton)", "London",
+                                           "Gloucester")) |>
+        transmute(region, ECS_ha_59, ECS_pct_59, expected_pct, divergence_pp))
+
+top_n_city <- 8
+
+# Each panel is its own leaderboard: the eight cities with the highest value of
+# that measure, sorted within the panel.
+make_leaderboard_panel_fig3 <- function(value_col, axis_label, scale = 1) {
+  d <- cities_fig3 |>
+    arrange(desc(.data[[value_col]])) |>
+    transmute(region, value = scale * .data[[value_col]]) |>
+    slice_head(n = top_n_city) |>
+    arrange(value)
+  d$region <- factor(d$region, levels = d$region)
+  ggplot(d, aes(x = value, y = region)) +
+    geom_col(fill = "steelblue4", width = 0.6) +
+    labs(x = axis_label, y = NULL) +
+    theme_minimal(base_size = 10.5)
+}
+
+p_ecs_ha  <- make_leaderboard_panel_fig3("ECS_ha_59", "Raw ECS (ha)")
+p_ecs_pct <- make_leaderboard_panel_fig3("ECS_pct_59", "Relative ECS (% of the region's woodland)", scale = 100)
+
+fig_named_cities <- p_ecs_ha | p_ecs_pct
+print(fig_named_cities)
+save_fig(fig_named_cities, "Fig04d_two_readings_named_cities", width = 9.5, height = 5.5)
+```
+
+# Supplementary Table 4: all 87 city regions
+
+Raw ECS, relative ECS and the size-adjusted difference at 59 and 99 m for
+every city region, with each city's rank on the size-adjusted difference at
+both thresholds. Reuses `build_leaderboard_fig3()` from the Figure 3 chunk
+above. Writes `figures/SuppTable4_city_connectivity.csv`.
+
+```{r results_supp_table4_city_connectivity}
+lb_99_fig3 <- build_leaderboard_fig3("ECS_pct_99")
+
+city_table <- cities_fig3 |>
+  transmute(Region = region, ECS_ha_59, ECS_pct_59, diff_59 = divergence_pp) |>
+  inner_join(lb_99_fig3 |>
+               filter(region %in% city_regions) |>
+               transmute(Region = region, ECS_pct_99, diff_99 = divergence_pp),
+             by = "Region") |>
+  mutate(rank_59 = rank(-diff_59), rank_99 = rank(-diff_99)) |>
+  arrange(Region)
+
+stopifnot(nrow(city_table) == 87)
+write.csv(city_table, file.path(figures_dir, "SuppTable4_city_connectivity.csv"), row.names = FALSE)
+print(head(city_table, 5))
+```
+
+# Figures 5 and 6 and Supplementary Figure 1: woodland amount against fragmentation
+
+Fits the beta-family GAMs and the matched-pairs comparison behind Figures 5 and 6, and the woodland-band analysis behind Supplementary Figure 1. Writes the three figures and the band estimates (Supplementary Table 2).
+
+```{r sloss_publication_figures}
+if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork", repos = "https://cloud.r-project.org")
+library(patchwork)
+
+# 10 ha floor: below this, ECS_pct is dominated by a handful of tiny
+# slivers and behaves as noise rather than a meaningful connectivity
+# measure (the same rationale as the minimum-area floors used elsewhere).
+sl <- ok |>
+  filter(total_area_ha >= 10, !is.na(ECS_pct_59), n_patches > 0)
+
+# Figure 5: woodland amount against fragmentation, same data, same y-axis
+# Both panels are single-predictor models so that the deviance-explained
+# values are a like-for-like comparison. The two-predictor model (area
+# and fragmentation together) is in Table 2 (`results_table2_model_comparison`
+# in 03_National_ECS.Rmd).
+#
+# Panel (b) uses n_patches rather than nClusters. nClusters is the count
+# of clusters produced by thresholding the graph at 59 m, and ECS is
+# computed from the same clusters' areas (sum(cluster_area^2) /
+# total_area), so regressing one on the other is partly circular.
+# n_patches is the count of physical woodland patches identified from the
+# raster before any threshold is applied, so it is independent of the ECS
+# calculation.
+#
+# Model class: ECS_pct_59 is a bounded proportion (0 to 1), for which OLS
+# has the wrong distributional assumption (heteroscedastic near the
+# boundaries) and the wrong functional form (an OLS fit on log(n_patches)
+# predicts negative connectivity at high patch counts). The models are
+# therefore beta-family GAMs (logit link, mgcv::betar) with k = 5, which
+# allows one real bend without chasing noise in the sparse tails. R^2 is
+# replaced by deviance explained, the equivalent summary for this model
+# class.
+library(mgcv)
+
+m_area <- gam(ECS_pct_59 ~ s(log(total_area_ha), k = 5), data = sl, family = betar(link = "logit"))
+m_frag <- gam(ECS_pct_59 ~ s(log(n_patches), k = 5), data = sl, family = betar(link = "logit"))
+dev_area <- summary(m_area)$dev.expl
+dev_frag <- summary(m_frag)$dev.expl
+
+pa <- ggplot(sl, aes(x = total_area_ha, y = ECS_pct_59)) +
+  geom_point(alpha = 0.22, colour = "grey35", size = 1.1) +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 5),
+              method.args = list(family = betar(link = "logit")),
+              colour = "steelblue", fill = "steelblue", alpha = 0.2) +
+  scale_x_log10() +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  annotate("label", x = min(sl$total_area_ha), y = 0.97, hjust = 0, label.size = 0,
+           fill = "white", alpha = 0.85, size = 4.2, fontface = "bold",
+           label = sprintf("Deviance explained = %.0f%%", 100 * dev_area)) +
+  labs(x = "Total woodland area (ha, log scale)",
+       y = "Expected Cluster Size (%)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(face = "bold", size = 12))
+
+pb <- ggplot(sl, aes(x = n_patches, y = ECS_pct_59)) +
+  geom_point(alpha = 0.22, colour = "grey35", size = 1.1) +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 5),
+              method.args = list(family = betar(link = "logit")),
+              colour = "firebrick", fill = "firebrick", alpha = 0.2) +
+  scale_x_log10() +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  annotate("label", x = max(sl$n_patches), y = 0.97, hjust = 1, label.size = 0,
+           fill = "white", alpha = 0.85, size = 4.2, fontface = "bold",
+           label = sprintf("Deviance explained = %.0f%%", 100 * dev_frag)) +
+  labs(x = "Number of separate woodland patches (log scale)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(face = "bold", size = 12),
+        axis.text.y = element_blank())
+
+fig1 <- (pa | pb) +
+  plot_annotation(
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+print(fig1)
+ggsave(file.path(figures_dir, "Fig05_area_vs_fragmentation.png"), fig1,
+       width = 11, height = 5.6, dpi = 300)
+cat("Fig 1 -- deviance explained, area:", round(dev_area, 3), "| fragmentation:", round(dev_frag, 3), "\n")
+
+# Figure 6: matched pairs (systematic nearest-area search)
+# Uses n_patches rather than nClusters_59: nClusters is a property of the
+# same thresholded graph that ECS is computed from, so comparing outcomes
+# by cluster count is partly circular. n_patches is independent of the
+# ECS calculation.
+n <- nrow(sl); area <- sl$total_area_ha; pct <- sl$ECS_pct_59
+region <- sl$region; nc <- sl$n_patches
+
+best_j <- integer(n); rel_j <- numeric(n)
+for (i in seq_len(n)) {
+  rel <- abs(area - area[i]) / area[i]; rel[i] <- Inf
+  j <- which.min(rel); best_j[i] <- j; rel_j[i] <- rel[j]
+}
+
+pairs_fig <- data.frame(
+  region_a = region, area_a = area, nc_a = nc, ecs_a = pct,
+  region_b = region[best_j], area_b = area[best_j], nc_b = nc[best_j], ecs_b = pct[best_j],
+  rel_diff = rel_j
+) |>
+  filter(rel_diff <= 0.05) |>
+  mutate(outcome_diff = abs(ecs_a - ecs_b),
+         key = paste(pmin(region_a, region_b), pmax(region_a, region_b))) |>
+  distinct(key, .keep_all = TRUE) |>
+  arrange(rel_diff, key)
+
+# One row per region: a region that is the nearest-area match for several
+# others would otherwise recur across rows, which reads as padding rather
+# than independent evidence.
+#
+# Pairs are sorted by rel_diff (closest area match first), not by the
+# outcome difference, before conflicts are resolved. When a region is the
+# nearest-area match for several others, whichever candidate pair is
+# processed first claims it; sorting by the outcome difference would let
+# the pair with the largest connectivity gap always win, enriching the
+# sample for bigger apparent effects. Sorting by area-match closeness
+# makes the rule independent of the outcome being tested.
+used <- character(0); keep <- logical(nrow(pairs_fig))
+for (i in seq_len(nrow(pairs_fig))) {
+  if (!(pairs_fig$region_a[i] %in% used) && !(pairs_fig$region_b[i] %in% used)) {
+    keep[i] <- TRUE
+    used <- c(used, pairs_fig$region_a[i], pairs_fig$region_b[i])
+  }
+}
+# The full set is kept separately, not just the pairs shown in the figure:
+# the SLOSS research agenda (Fahrig et al.) recommends comparing multiple
+# matched landscapes rather than a few illustrative ones, and the summary
+# chunk below reports across all of them.
+#
+# pairs_fig_full is the formal sample, built from woodland-area
+# similarity only, with no knowledge of ECS. Sorting by outcome_diff
+# happens only when choosing the pairs to display, never when deciding
+# which pairs survive the de-duplication above.
+pairs_fig_full <- pairs_fig[keep, ]
+# Display set: the seven largest differences among pairs in which the region
+# with fewer patches was the better connected. The statistical tests above use
+# every pair, including those that go the other way.
+pairs_fig <- pairs_fig_full |>
+  filter((nc_a < nc_b & ecs_a > ecs_b) | (nc_b < nc_a & ecs_b > ecs_a)) |>
+  arrange(desc(outcome_diff)) |>
+  head(7)
+
+pl <- pairs_fig |>
+  mutate(
+    win_region  = ifelse(ecs_a >= ecs_b, region_a, region_b),
+    win_ecs     = pmax(ecs_a, ecs_b),
+    win_nc      = ifelse(ecs_a >= ecs_b, nc_a, nc_b),
+    lose_region = ifelse(ecs_a >= ecs_b, region_b, region_a),
+    lose_ecs    = pmin(ecs_a, ecs_b),
+    lose_nc     = ifelse(ecs_a >= ecs_b, nc_b, nc_a),
+    pair_label  = sprintf("%s  vs  %s\n(~%.0f ha each)", win_region, lose_region, area_a)
+  ) |>
+  arrange(win_ecs - lose_ecs) |>
+  mutate(pair_label = factor(pair_label, levels = pair_label))
+
+fig2 <- ggplot(pl) +
+  geom_segment(aes(y = pair_label, yend = pair_label, x = lose_ecs, xend = win_ecs),
+               colour = "grey65", linewidth = 1.4) +
+  geom_point(aes(y = pair_label, x = lose_ecs), colour = "firebrick", size = 5.5) +
+  geom_point(aes(y = pair_label, x = win_ecs), colour = "forestgreen", size = 5.5) +
+  geom_text(aes(y = pair_label, x = lose_ecs, label = lose_nc), colour = "white", size = 2.7, fontface = "bold") +
+  geom_text(aes(y = pair_label, x = win_ecs, label = win_nc), colour = "white", size = 2.7, fontface = "bold") +
+  scale_x_continuous(labels = scales::percent, limits = c(-0.02, 1.05)) +
+  labs(
+    x = "Expected Cluster Size (%)", y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 10.5, lineheight = 1.15),
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 9.5, lineheight = 1.1),
+        plot.margin = margin(12, 18, 12, 12))
+print(fig2)
+ggsave(file.path(figures_dir, "Fig06_matched_pairs.png"), fig2, width = 12, height = 7, dpi = 300)
+
+# Supplementary Figure 1: the effect across woodland amount bands, at both thresholds
+# Model class: each band's effect is estimated with a beta-family GLM
+# (logit link), not OLS, for the same reason as Figure 5: relative ECS is
+# a bounded proportion. A linear term within a band is a reasonable local
+# approximation even though the global relationship is curved, because
+# each band spans a much narrower range of x than the full dataset (the
+# logic behind piecewise regression).
+#
+# Reporting scale: the model is fitted on the logit scale, but a raw
+# coefficient is a log-odds value, which is not readable here. Each
+# band's effect is therefore reported as the predicted change in
+# connectivity (percentage points, response scale) between that band's
+# own 25th and 75th percentile of patch count, back-transformed with
+# predict(..., type = "response").
+#
+# The confidence interval on that difference cannot use the coefficient's
+# own standard error, because the probability difference is a nonlinear
+# function of both the intercept and the slope. Instead, coefficient
+# vectors are simulated from their fitted sampling distribution
+# (MVN(coef(f), vcov(f))), the predicted difference is computed for each
+# draw, and the 2.5th and 97.5th percentiles are taken (the approach
+# recommended in the mgcv documentation). MASS::mvrnorm is called via `::`
+# rather than library(MASS), to avoid attaching a package that masks
+# dplyr::select.
+mk_bands <- function(pct_col, label, n_sim = 2000) {
+  s <- sl |> filter(!is.na(.data[[pct_col]]), !is.na(n_patches), n_patches > 0)
+  s$logc <- log(s$n_patches)
+  br <- 10^seq(log10(min(s$total_area_ha)), log10(max(s$total_area_ha)), length.out = 9)
+  s$bin <- cut(s$total_area_ha, breaks = br, include.lowest = TRUE, labels = FALSE)
+  s |>
+    group_by(bin) |>
+    filter(n() >= 15) |>
+    group_modify(~ {
+      f <- gam(reformulate("logc", response = pct_col), data = .x, family = betar(link = "logit"))
+      q <- quantile(.x$logc, c(0.25, 0.75), names = FALSE)
+
+      pred_pt <- predict(f, newdata = data.frame(logc = q), type = "response")
+      effect_pt <- 100 * (pred_pt[2] - pred_pt[1])
+
+      Xp <- predict(f, newdata = data.frame(logc = q), type = "lpmatrix")
+      draws <- MASS::mvrnorm(n_sim, mu = coef(f), Sigma = vcov(f))
+      pr <- plogis(draws %*% t(Xp))
+      eff_draws <- 100 * (pr[, 2] - pr[, 1])
+      ci <- quantile(eff_draws, c(0.025, 0.975))
+
+      data.frame(n = nrow(.x), amin = min(.x$total_area_ha), amax = max(.x$total_area_ha),
+                 q25_patches = round(exp(q[1])), q75_patches = round(exp(q[2])),
+                 slope = effect_pt, lo = unname(ci[1]), hi = unname(ci[2]))
+    }) |>
+    ungroup() |>
+    mutate(threshold = label, band = sprintf("%.0f–%.0f ha", amin, amax))
+}
+
+# Uses n_patches rather than nClusters_*, for the same reason as in
+# Figure 5 and the matched-pairs analysis above. n_patches does not
+# depend on the movement threshold, so mk_bands() needs no
+# predictor-column argument; only the outcome column varies by threshold.
+set.seed(20261022)  # fixed so the band confidence intervals reproduce exactly
+bands <- bind_rows(
+  mk_bands("ECS_pct_59", "59 m"),
+  mk_bands("ECS_pct_99", "99 m")
+)
+bands$band <- factor(bands$band, levels = unique(bands$band[order(bands$amin)]))
+
+fig3 <- ggplot(bands, aes(x = band, y = slope, colour = threshold)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey45") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(width = 0.45), linewidth = 0.8) +
+  scale_colour_manual(values = c("59 m" = "firebrick", "99 m" = "steelblue"), name = "Dispersal\nthreshold") +
+  labs(
+    x = "Woodland amount band (total woodland area)",
+    y = "Change in connectivity, 25th–75th pct. of patch count\n(percentage points; more negative = fragmentation hurts more)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+print(fig3)
+ggsave(file.path(figures_dir, "Fig07_effect_across_city_size.png"), fig3, width = 10, height = 6.2, dpi = 300)
+write.csv(bands, file.path(figures_dir, "Supp_woodland_amount_band_effects.csv"), row.names = FALSE)
+```
+
+# Figure 7 and Supplementary Table 3: does patch spacing add anything?
+
+Uses the same code as the `sloss_spacing_partial_effect`,
+`sloss_spacing_partial_plot` and `sloss_spacing_table` chunks in
+`03_National_ECS.Rmd`. The spacing measurements are read from the saved
+national patch-spacing file and are not re-extracted here.
+
+```{r results_fig7_spacing_model}
+prior_spacing <- read.csv(file.path(checkpoint_dir, "08_national_patch_spacing.csv"), stringsAsFactors = FALSE)
+
+sls <- sl |>
+  inner_join(prior_spacing, by = "region") |>
+  filter(!is.na(median_euclidean_dist), median_euclidean_dist > 0)
+cat("Regions with spacing data:", nrow(sls), "of", nrow(sl), "\n")
+
+m_area_patches_sub <- gam(ECS_pct_59 ~ s(log_area, k = 5) + s(log(n_patches), k = 5),
+                           data = sls, family = betar(link = "logit"), method = "REML")
+m_spacing <- gam(ECS_pct_59 ~ s(log_area, k = 5) + s(log(n_patches), k = 5) +
+                    s(log(median_euclidean_dist), k = 5),
+                  data = sls, family = betar(link = "logit"), method = "REML")
+
+cat("Deviance explained, area + patches:", round(summary(m_area_patches_sub)$dev.expl, 3), "\n")
+cat("Deviance explained, + spacing:", round(summary(m_spacing)$dev.expl, 3), "\n")
+cat("AIC, area + patches:", round(AIC(m_area_patches_sub), 1), "\n")
+cat("AIC, + spacing:", round(AIC(m_spacing), 1), "\n")
+
+# Does spacing explain Milton Keynes specifically, or just add general
+# explanatory power? Its residual under each model answers this: if
+# spacing were the missing piece for Milton Keynes, its residual would
+# shrink substantially once spacing is added.
+mk_idx <- which(sls$region == "Milton Keynes")
+if (length(mk_idx) == 1) {
+  cat("\nMilton Keynes: n_patches =", sls$n_patches[mk_idx],
+      ", median inter-patch distance =", round(sls$median_euclidean_dist[mk_idx], 1), "m\n")
+  cat("Milton Keynes residual, area + patches model:",
+      round(residuals(m_area_patches_sub, type = "response")[mk_idx], 3), "\n")
+  cat("Milton Keynes residual, + spacing model:",
+      round(residuals(m_spacing, type = "response")[mk_idx], 3), "\n")
+}
+```
+
+Plots the partial effect of patch spacing on relative ECS.
+
+```{r results_fig7_spacing_partial_plot}
+med_area_s <- median(sls$total_area_ha)
+med_patches_s <- median(sls$n_patches)
+band_s <- sls |> filter(total_area_ha >= med_area_s * 0.8, total_area_ha <= med_area_s * 1.25,
+                         n_patches >= med_patches_s * 0.8, n_patches <= med_patches_s * 1.25)
+spacing_min <- min(band_s$median_euclidean_dist)
+spacing_max <- max(band_s$median_euclidean_dist)
+cat("Regions in area+patches joint band:", nrow(band_s), "\n")
+cat("Supported spacing range in that band:", round(spacing_min, 1), "-", round(spacing_max, 1), "m\n")
+
+spacing_seq <- exp(seq(log(spacing_min), log(spacing_max), length.out = 200))
+pred_grid_s <- data.frame(log_area = log(med_area_s), n_patches = med_patches_s,
+                           median_euclidean_dist = spacing_seq)
+pred_s <- predict(m_spacing, newdata = pred_grid_s, type = "link", se.fit = TRUE)
+pred_df_s <- data.frame(
+  spacing = spacing_seq,
+  fit = plogis(pred_s$fit),
+  lo = plogis(pred_s$fit - 1.96 * pred_s$se.fit),
+  hi = plogis(pred_s$fit + 1.96 * pred_s$se.fit)
+)
+
+mk_spacing <- sls$median_euclidean_dist[sls$region == "Milton Keynes"]
+
+fig_spacing_partial <- ggplot(pred_df_s, aes(x = spacing, y = fit)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "grey70", alpha = 0.5) +
+  geom_line(colour = "forestgreen", linewidth = 1) +
+  geom_vline(xintercept = mk_spacing, linetype = "dashed", colour = "firebrick") +
+  annotate("text", x = mk_spacing, y = max(pred_df_s$hi), label = "Milton Keynes\n(82m)",
+           colour = "firebrick", size = 3.2, hjust = -0.05, vjust = 1) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, max(pred_df_s$hi) * 1.15)) +
+  labs(
+    x = "Median inter-patch distance (m, log scale)",
+    y = "Predicted relative Expected Cluster Size"
+  ) +
+  scale_x_log10() +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 13.5),
+        plot.subtitle = element_text(size = 9.5, lineheight = 1.2))
+print(fig_spacing_partial)
+save_fig(fig_spacing_partial, "Fig_SLOSS_spacing_partial_effect", width = 9.5, height = 6.8)
+```
+
+Writes Supplementary Table 3: the regions with the most patches, with observed and predicted relative ECS.
+
+```{r results_supp_table2_top_patch_regions}
+sls$predicted_ECS_pct <- predict(m_spacing, type = "response")
+sls$residual_pp <- 100 * (sls$ECS_pct_59 - sls$predicted_ECS_pct)
+
+top_patches_table <- sls |>
+  arrange(desc(n_patches)) |>
+  slice_head(n = 12) |>
+  transmute(
+    Region = region,
+    `Woodland (ha)` = round(total_area_ha, 1),
+    Patches = n_patches,
+    `Spacing (m)` = round(median_euclidean_dist, 1),
+    `Actual ECS (%)` = round(100 * ECS_pct_59, 1),
+    `Predicted ECS (%)` = round(100 * predicted_ECS_pct, 1),
+    `Residual (pp)` = round(residual_pp, 1)
+  )
+
+print(top_patches_table, row.names = FALSE)
+write.csv(top_patches_table, file.path(figures_dir, "TableS_spacing_top_patch_count_regions.csv"), row.names = FALSE)
+```
+
+# Resistance surface maps: Milton Keynes and Gloucester (Methods illustration)
+
+Milton Keynes and Gloucester, drawn from the same surface used in the
+connectivity analysis (LCM 10 m with NFI woodland added, clipped to the
+region boundary). Colours come from an explicit class table, as in the
+`gloucester_full_landcover` chunk of `03_National_ECS.Rmd`. Each legend
+entry shows the resistance value in brackets. No title is drawn on the
+image.
+
+```{r results_resistance_surface_maps}
+library(terra)
+
+lcm_class_labels <- c(
+  `1` = "Woodland",
+  `3` = "Arable", `4` = "Improved grassland", `5` = "Neutral grassland",
+  `6` = "Calcareous grassland", `7` = "Acid grassland",
+  `8` = "Fen, marsh, swamp", `9` = "Heather", `10` = "Heather grassland",
+  `11` = "Bog", `12` = "Inland rock", `13` = "Saltwater",
+  `14` = "Freshwater", `15` = "Supra-littoral rock",
+  `16` = "Supra-littoral sediment", `17` = "Littoral rock",
+  `18` = "Littoral sediment", `19` = "Saltmarsh", `20` = "Urban",
+  `21` = "Suburban"
+)
+resistance_plot_colours <- c(
+  `1`  = "#1b5e20", `3`  = "#e8a33d", `4`  = "#7cb342", `5`  = "#e0c14c",
+  `6`  = "#d4b83c", `7`  = "#c9a227", `8`  = "#8d6e52", `9`  = "#9575cd",
+  `10` = "#b39ddb", `11` = "#6d4c35", `12` = "#b0a89a", `13` = "#2a9d8f",
+  `14` = "#4a90d9", `15` = "#c2b8a3", `16` = "#cabb9c", `17` = "#a89f91",
+  `18` = "#d1c3a3", `19` = "#c98fb0", `20` = "#4d4d4d", `21` = "#8c8c8c"
+)
+
+save_resistance_map <- function(region_name, file_name, width_px = 2800) {
+  region <- urban_regions_named |> filter(bua_name == region_name)
+  bbox <- st_bbox(region)
+  lcm_zoom <- rast(lcm_file) |> crop(vect(st_as_sfc(bbox)))
+  nfi_zoom <- st_crop(nfi_urban, bbox) |> st_collection_extract("POLYGON")
+  nfi_raster <- rasterize(vect(nfi_zoom), lcm_zoom[[1]], field = 1, background = 0)
+
+  classified <- lcm_zoom[[1]]
+  classified[(lcm_zoom[[1]] %in% c(1, 2)) | (nfi_raster > 0)] <- 1
+  classified <- mask(classified, vect(region)) |> trim()
+
+  present <- sort(unique(values(classified, na.rm = TRUE)))
+  present_chr <- as.character(present)
+  # Class names and colours are attached to the raster by class number
+  # (levels + coltab), so a colour can never slip onto the wrong class.
+  levels(classified) <- data.frame(
+    id = present,
+    category = paste0(lcm_class_labels[present_chr], " (", resistance_lookup[present_chr], ")")
+  )
+  coltab(classified) <- data.frame(value = present, col = unname(resistance_plot_colours[present_chr]))
+
+  woodland_ha <- sum(values(classified) == 1, na.rm = TRUE) * prod(res(classified)) / 10000
+  cat(region_name, "woodland on this map:", round(woodland_ha, 1), "ha\n")
+
+  height_px <- round(width_px * nrow(classified) / ncol(classified)) + 100
+  png(file.path(figures_dir, file_name), width = width_px, height = height_px, res = 300)
+  plot(classified, axes = FALSE, mar = c(0.5, 0.5, 0.5, 0.5),
+       plg = list(x = "topright", cex = 0.9, title = "Surface type (resistance)"))
+  dev.off()
+  invisible(file.path(figures_dir, file_name))
+}
+
+save_resistance_map("Milton Keynes", "Fig_resistance_surface_milton_keynes.png")
+save_resistance_map("Gloucester", "Fig_resistance_surface_gloucester.png")
+```
+
+Alternative version: the same two surfaces coloured by resistance value
+(1 = woodland, 10 = hardest to cross) on one shared colour bar, side by
+side.
+
+```{r results_resistance_surface_pair}
+library(terra)
+
+resistance_value_raster <- function(region_name) {
+  region <- urban_regions_named |> filter(bua_name == region_name)
+  bbox <- st_bbox(region)
+  lcm_zoom <- rast(lcm_file) |> crop(vect(st_as_sfc(bbox)))
+  nfi_zoom <- st_crop(nfi_urban, bbox) |> st_collection_extract("POLYGON")
+  nfi_raster <- rasterize(vect(nfi_zoom), lcm_zoom[[1]], field = 1, background = 0)
+
+  classified <- lcm_zoom[[1]]
+  classified[(lcm_zoom[[1]] %in% c(1, 2)) | (nfi_raster > 0)] <- 1
+  classified <- mask(classified, vect(region)) |> trim()
+
+  resistance_r <- subst(classified, from = as.numeric(names(resistance_lookup)), to = as.numeric(resistance_lookup))
+  # A cell with no land-cover class stays 0 after the lookup; treat it as blank.
+  ifel(resistance_r == 0, NA, resistance_r)
+}
+
+# Resistance 1 (woodland) = dark green, resistance 10 = white.
+resistance_palette <- colorRampPalette(c("#00441b", "#238b45", "#74c476", "#c7e9c0", "#ffffff"))(100)
+
+# Highlighted version: each resistance value that occurs in these two cities
+# gets its own step, lightening from deep green (woodland) to a soft cream
+# (resistance 10), so 8 and 10 can be told apart without a glaring white.
+resistance_steps <- c(`1` = "#00441b", `2` = "#5cb765", `5` = "#8fcf8a", `6` = "#a8d9a0",
+                      `7` = "#c0e1b6", `8` = "#d9edc9", `10` = "#f4f1e6")
+woodland_green <- "#00441b"
+
+r_mk <- resistance_value_raster("Milton Keynes")
+r_gl <- resistance_value_raster("Gloucester")
+
+# Every resistance value in the two maps needs a colour step.
+stopifnot(all(unique(c(values(r_mk), values(r_gl))[!is.na(c(values(r_mk), values(r_gl)))]) %in%
+                as.numeric(names(resistance_steps))))
+
+draw_resistance_panel <- function(r, city_label, region_name, scale_km, sbar_pos = "bottomleft",
+                                  highlight_woodland = FALSE) {
+  if (!highlight_woodland) {
+    plot(r, col = resistance_palette, range = c(1, 10), legend = FALSE, axes = FALSE,
+         mar = c(0.5, 0.5, 2.5, 0.5), main = city_label)
+  } else {
+    r_cat <- r
+    ids <- as.numeric(names(resistance_steps))
+    levels(r_cat) <- data.frame(id = ids, label = as.character(ids))
+    coltab(r_cat) <- data.frame(value = ids, col = unname(resistance_steps))
+    plot(r_cat, legend = FALSE, axes = FALSE, mar = c(0.5, 0.5, 2.5, 0.5), main = city_label)
+    woodland <- ifel(r == 1, 1, NA)
+    plot(as.polygons(woodland), col = NA, border = woodland_green, lwd = 0.6, add = TRUE)
+  }
+  # Thin outline so the city shape stays visible.
+  plot(vect(urban_regions_named |> filter(bua_name == region_name)), border = "grey40", lwd = 0.8, add = TRUE)
+  sbar(scale_km * 1000, xy = sbar_pos, type = "bar", divs = 2, below = "km",
+       labels = c(0, scale_km / 2, scale_km), cex = 0.9)
+}
+
+save_resistance_pair <- function(file_name, highlight_woodland) {
+  total_w <- ncol(r_mk) + ncol(r_gl)
+  png(file.path(figures_dir, file_name),
+      width = 5400, height = round(5400 * max(nrow(r_mk), nrow(r_gl)) / (total_w * 1.06)) + 150, res = 300)
+  layout(matrix(1:3, nrow = 1), widths = c(ncol(r_mk), ncol(r_gl), 0.06 * total_w))
+  draw_resistance_panel(r_mk, "Milton Keynes", "Milton Keynes", 4, highlight_woodland = highlight_woodland)
+  draw_resistance_panel(r_gl, "Gloucester", "Gloucester", 2, "bottomright", highlight_woodland = highlight_woodland)
+
+  par(mar = c(8, 0.5, 4, 4.5))
+  if (!highlight_woodland) {
+    y <- seq(1, 10, length.out = 200)
+    image(x = 1, y = y, z = matrix(y, nrow = 1),
+          col = resistance_palette[pmin(100, pmax(1, round((y - 1) / 9 * 99) + 1))],
+          axes = FALSE, xlab = "", ylab = "")
+    axis(4, at = 1:10, las = 1, cex.axis = 1.1)
+  } else {
+    n_steps <- length(resistance_steps)
+    image(x = 1, y = seq_len(n_steps), z = matrix(seq_len(n_steps), nrow = 1),
+          col = unname(resistance_steps), axes = FALSE, xlab = "", ylab = "")
+    axis(4, at = seq_len(n_steps), labels = names(resistance_steps), las = 1, cex.axis = 1.1)
+  }
+  mtext("Resistance (1 = woodland)", side = 4, line = 3.2, cex = 0.95)
+  box()
+  dev.off()
+}
+
+save_resistance_pair("Fig_resistance_surface_by_resistance_pair.png", highlight_woodland = FALSE)
+save_resistance_pair("Fig_resistance_surface_by_resistance_pair_woodland_highlight.png", highlight_woodland = TRUE)
+```
+
+# Urban region delineation figure (London), illustrating the morphological closing (Methods illustration)
+
+Draws the delineation of London in three panels: the raw built-up areas, after closing, and the final region.
+
+```{r closing_stages_london}
+library(sf)
+
+plot_closing_stages <- function(
+  bbox = st_bbox(
+    c(xmin = 500000, ymin = 145000, xmax = 570000, ymax = 210000),
+    crs = st_crs(27700)
+  ),
+  region_name = "London",
+  out_file = file.path(figures_dir, "supp_closing_stages_london.png")
+) {
+
+  urban_closed <- readRDS(file.path(checkpoint_dir, "05_urban_closed.rds"))
+
+  # The final panel shows the delineated region alone, not a bbox crop of
+  # the general hole-filled layer, which would also show other regions
+  # inside the same rectangular window.
+  region_final <- urban_regions_named |> filter(bua_name == region_name)
+
+  woodland_bbox <- st_crop(nfi_urban, bbox) |> st_collection_extract("POLYGON")
+  # Intersection with the polygon itself, not a bbox crop: a bbox crop is
+  # a rectangle, so woodland outside London's irregular boundary but
+  # inside the rectangle would still show.
+  woodland_region <- suppressWarnings(st_intersection(
+    st_crop(nfi_urban, st_bbox(region_final)), region_final
+  )) |> st_collection_extract("POLYGON")
+
+  xl <- bbox[c("xmin", "xmax")]; yl <- bbox[c("ymin", "ymax")]
+
+  # Rendered to a fixed-size PNG device explicitly, because knitr's
+  # fig.width and fig.height are honoured only on a full knit, not when a
+  # chunk is run interactively. Panel dimensions (4 in x 3.71 in) follow
+  # the bbox's aspect ratio (70 km / 65 km) so all three panels are
+  # identically proportioned, and all three share the same xlim and ylim
+  # rather than auto-fitting to their own extent.
+  png(out_file, width = 12.3, height = 4.16, units = "in", res = 300)
+  par(mfrow = c(1, 3), mai = c(0.05, 0.05, 0.4, 0.05))
+
+  plot(
+    st_geometry(st_crop(bua, bbox)),
+    col = "grey70", border = "black",
+    main = paste0("Raw BUAs: ", region_name),
+    xlim = xl, ylim = yl
+  )
+  plot(st_geometry(woodland_bbox), col = "darkgreen", border = NA, add = TRUE)
+  # Highlights a cluster of gaps between raw BUAs that closing later
+  # fills (the circle coordinates are hard-coded).
+  symbols(520130, 173274, circles = 4530, inches = FALSE, add = TRUE, fg = "red", lwd = 3)
+
+  plot(
+    st_geometry(st_crop(urban_closed, bbox)),
+    col = "grey70", border = "black",
+    main = paste0("After closing: ", region_name),
+    xlim = xl, ylim = yl
+  )
+  plot(st_geometry(woodland_bbox), col = "darkgreen", border = NA, add = TRUE)
+
+  plot(
+    st_geometry(region_final),
+    col = "grey70", border = "black",
+    main = paste0("After hole-fill: ", region_name),
+    xlim = xl, ylim = yl
+  )
+  plot(st_geometry(woodland_region), col = "darkgreen", border = NA, add = TRUE)
+
+  dev.off()
+  knitr::include_graphics(out_file)
+}
+
+plot_closing_stages()
+```
