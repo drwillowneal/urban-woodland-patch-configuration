@@ -159,9 +159,10 @@ cat(
 )
 
 # Name overrides for collective names where even the
-# two-largest-constituents rule reads badly. The table currently holds one
-# case, Blackwater Valley, a ten-town group that the rule would name after
-# its two largest towns. Read from region_name_overrides.csv (see
+# two-largest-constituents rule reads badly. The table holds two cases:
+# Blackwater Valley, a ten-town group that the rule would name after its
+# two largest towns, and London, whose 96 borough-level BUAs the rule would
+# name "Bromley & Hillingdon". Read from region_name_overrides.csv (see
 # 00_setup.R) and matched by each group's set of constituent BUAs rather
 # than by closing_group id, which is not stable across re-runs. Rows are
 # added by hand.

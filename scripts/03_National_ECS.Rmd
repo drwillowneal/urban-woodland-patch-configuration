@@ -45,8 +45,22 @@ Regions are processed from smallest to largest by area, so results
 accumulate quickly for the many small and medium regions, and the few
 very expensive large conurbations are attempted last.
 
+Loads the shared settings and packages, and sets up the figures folder and the `save_fig()` helper used by the plotting chunks.
+
 ```{r setup}
 source(here::here("scripts", "00_setup.R"))
+
+# Figures are written here as well as shown in the plot pane. The folder
+# is in the project, not on the checkpoint drive, because these are small
+# outputs that belong with the manuscript.
+figures_dir <- here::here("figures")
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+save_fig <- function(plot_obj, name, width = 9, height = 6.5) {
+  ggsave(file.path(figures_dir, paste0(name, ".png")),
+         plot_obj, width = width, height = height, dpi = 300)
+  invisible(plot_obj)
+}
 ```
 
 Loads the named urban regions and the clipped NFI woodland polygons saved by `01b`.
@@ -239,13 +253,124 @@ build_region_mpg <- function(region_name) {
 }
 ```
 
+# National loop
+
+Computes ECS at 59, 99 and 512 m for every region, from the smallest to the largest, and saves the results to `08_national_ecs_results.csv` after each region. Regions already in that file are skipped, and a region that fails is logged and the loop moves on.
+
+```{r national_loop}
+results_path <- file.path(checkpoint_dir, "08_national_ecs_results.csv")
+
+urban_regions_named$area_ha <- as.numeric(st_area(urban_regions_named)) / 10000
+all_regions <- urban_regions_named |> arrange(area_ha) |> pull(bua_name) |> unique()
+
+if (file.exists(results_path)) {
+  prior <- read.csv(results_path, stringsAsFactors = FALSE)
+  cat("Resuming: found", nrow(prior), "already-completed regions.\n")
+  remaining <- setdiff(all_regions, prior$region)
+} else {
+  prior <- NULL
+  remaining <- all_regions
+}
+
+cat("Regions remaining to process:", length(remaining), "of", length(all_regions), "\n\n")
+
+row_names <- c(
+  "region", "area_ha", "n_patches", "n_links", "total_area_ha",
+  "ECS_ha_59", "nClusters_59", "ECS_pct_59", "largest_cluster_share_59", "mean_cluster_size_ha_59",
+  "ECS_ha_99", "nClusters_99", "ECS_pct_99", "largest_cluster_share_99", "mean_cluster_size_ha_99",
+  "ECS_ha_512", "nClusters_512", "ECS_pct_512", "largest_cluster_share_512", "mean_cluster_size_ha_512",
+  "goc_bypassed", "error"
+)
+
+for (i in seq_along(remaining)) {
+  rn <- remaining[i]
+  area_ha <- urban_regions_named$area_ha[urban_regions_named$bua_name == rn][1]
+  t0 <- Sys.time()
+
+  res <- tryCatch({
+    r <- build_region_mpg(rn)
+    row <- data.frame(
+      region = rn, area_ha = area_ha,
+      n_patches = vcount(r$mpg@mpg), n_links = ecount(r$mpg@mpg),
+      total_area_ha = r$total_area_ha
+    )
+    for (j in seq_along(fixed_thresholds)) {
+      th <- fixed_thresholds[j]
+      row[[paste0("ECS_ha_", th)]] <- r$ecs_summary$ECS_ha[j]
+      row[[paste0("nClusters_", th)]] <- r$ecs_summary$nPolygon[j]
+      row[[paste0("ECS_pct_", th)]] <- r$ecs_summary$ECS_ha[j] / r$total_area_ha
+      row[[paste0("largest_cluster_share_", th)]] <- r$breakdown[[j]]$largest_cluster_share
+      row[[paste0("mean_cluster_size_ha_", th)]] <- r$breakdown[[j]]$mean_cluster_size_ha
+    }
+    row$goc_bypassed <- r$goc_bypassed
+    row$error <- NA
+    row
+  }, error = function(e) {
+    row <- as.data.frame(setNames(as.list(rep(NA, length(row_names))), row_names))
+    row$region <- rn
+    row$area_ha <- area_ha
+    row$error <- conditionMessage(e)
+    row
+  })
+
+  elapsed <- round(as.numeric(Sys.time() - t0, units = "secs"), 1)
+  status <- if (is.na(res$error)) "ok" else paste("FAILED:", res$error)
+  cat(sprintf("[%d/%d] %s (%.1f ha) — %.1fs — %s\n", i, length(remaining), rn, area_ha, elapsed, status))
+
+  # Append-and-rewrite: safe against interruption at any point, and cheap
+  # at this number of rows and columns.
+  combined <- if (is.null(prior)) res else bind_rows(prior, res)
+  prior <- combined
+  write.csv(combined, results_path, row.names = FALSE)
+}
+
+cat("\n=== NATIONAL RUN COMPLETE ===\n")
+cat("Total regions:", nrow(prior), " — failures:", sum(!is.na(prior$error)), "\n")
+```
+
+## Repair of GOC() silent-failure regions in the checkpoint
+
+`build_region_mpg()` above catches GOC() returning internally impossible
+cluster areas (the consistency check in the ECS branch), so new runs of
+`national_loop` correct themselves. `national_loop` is resumable and
+skips any region already in `08_national_ecs_results.csv`, so rows
+computed before that check existed would keep their bad values. This
+chunk finds those rows using the same invariant (ECS_pct can never be
+less than largest_cluster_share^2, at any threshold) and removes them, so
+that `national_loop` recomputes them the next time it runs. When nothing
+is broken it finds and removes 0 regions, so it is safe to re-run.
+
+```{r national_loop_goc_consistency_fix}
+prior <- read.csv(results_path, stringsAsFactors = FALSE)
+tol <- 0.01
+
+find_violations <- function(df, pct_col, share_col) {
+  sub <- df |> filter(!is.na(.data[[pct_col]]), !is.na(.data[[share_col]]))
+  sub$region[sub[[pct_col]] < (sub[[share_col]]^2 - tol)]
+}
+bad_regions <- unique(c(
+  find_violations(prior, "ECS_pct_59", "largest_cluster_share_59"),
+  find_violations(prior, "ECS_pct_99", "largest_cluster_share_99"),
+  find_violations(prior, "ECS_pct_512", "largest_cluster_share_512")
+))
+cat("Regions with an internally-inconsistent ECS value:", length(bad_regions), "\n")
+
+if (length(bad_regions) > 0) {
+  file.copy(results_path, sub("\\.csv$", "_BACKUP_before_goc_fix.csv", results_path), overwrite = FALSE)
+  prior <- prior |> filter(!(region %in% bad_regions))
+  write.csv(prior, results_path, row.names = FALSE)
+  cat("Removed from checkpoint; re-run the national_loop chunk above to recompute them",
+      "with the now-fixed build_region_mpg().\n")
+}
+```
+
 # Resistance-value sensitivity: Monte Carlo perturbation
 
 Tests whether regional rankings depend on the resistance values assumed.
 Every non-woodland resistance value is randomly perturbed by up to two
 points and ECS is recomputed for a stratified sample of 20 regions (4
 size groups x 5 regions, log-spaced by footprint area, seed 20260729,
-excluding the four mega-conurbations). Rank correlations with the
+excluding the four largest regions). Rank correlations with the
 unperturbed baseline are calculated in
 `analyse_resistance_sensitivity_512m` below.
 
@@ -258,7 +383,9 @@ area_all <- urban_regions_named |>
   sf::st_drop_geometry() |>
   arrange(desc(area_ha))
 
-mega <- c("London", "Manchester & Bolton (Bolton)", "Birmingham & Wolverhampton", "Leeds & Bradford")
+# The four largest regions are left out: they are by far the slowest to
+# model, and 20 runs on each would not be practical.
+mega <- head(area_all$bua_name, 4)
 pool <- area_all |> filter(!bua_name %in% mega, area_ha > 0)
 
 n_groups <- 4
@@ -662,8 +789,8 @@ neighbours in the ranked list, Speckled Wood (73 m) and Marbled White
 ```{r threshold_sensitivity_new_anchors}
 set.seed(20260814)
 
-# Re-derive the same stratified sample used in the resistance
-# perturbation test above, so results are directly comparable.
+# A separate sample from the resistance test: 20 log-spaced size bands,
+# one region drawn from each, again leaving out the four largest regions.
 area_all2 <- urban_regions_named |>
   mutate(area_ha = as.numeric(sf::st_area(urban_regions_named)) / 10000) |>
   sf::st_drop_geometry() |>
@@ -786,117 +913,6 @@ sens_table <- data.frame(
 )
 print(sens_table, row.names = FALSE)
 write.csv(sens_table, file.path(figures_dir, "SuppTable5_sensitivity_summary.csv"), row.names = FALSE)
-```
-
-# National loop
-
-Computes ECS at 59, 99 and 512 m for every region, from the smallest to the largest, and saves the results to `08_national_ecs_results.csv` after each region. Regions already in that file are skipped, and a region that fails is logged and the loop moves on.
-
-```{r national_loop}
-results_path <- file.path(checkpoint_dir, "08_national_ecs_results.csv")
-
-urban_regions_named$area_ha <- as.numeric(st_area(urban_regions_named)) / 10000
-all_regions <- urban_regions_named |> arrange(area_ha) |> pull(bua_name) |> unique()
-
-if (file.exists(results_path)) {
-  prior <- read.csv(results_path, stringsAsFactors = FALSE)
-  cat("Resuming: found", nrow(prior), "already-completed regions.\n")
-  remaining <- setdiff(all_regions, prior$region)
-} else {
-  prior <- NULL
-  remaining <- all_regions
-}
-
-cat("Regions remaining to process:", length(remaining), "of", length(all_regions), "\n\n")
-
-row_names <- c(
-  "region", "area_ha", "n_patches", "n_links", "total_area_ha",
-  "ECS_ha_59", "nClusters_59", "ECS_pct_59", "largest_cluster_share_59", "mean_cluster_size_ha_59",
-  "ECS_ha_99", "nClusters_99", "ECS_pct_99", "largest_cluster_share_99", "mean_cluster_size_ha_99",
-  "ECS_ha_512", "nClusters_512", "ECS_pct_512", "largest_cluster_share_512", "mean_cluster_size_ha_512",
-  "goc_bypassed", "error"
-)
-
-for (i in seq_along(remaining)) {
-  rn <- remaining[i]
-  area_ha <- urban_regions_named$area_ha[urban_regions_named$bua_name == rn][1]
-  t0 <- Sys.time()
-
-  res <- tryCatch({
-    r <- build_region_mpg(rn)
-    row <- data.frame(
-      region = rn, area_ha = area_ha,
-      n_patches = vcount(r$mpg@mpg), n_links = ecount(r$mpg@mpg),
-      total_area_ha = r$total_area_ha
-    )
-    for (j in seq_along(fixed_thresholds)) {
-      th <- fixed_thresholds[j]
-      row[[paste0("ECS_ha_", th)]] <- r$ecs_summary$ECS_ha[j]
-      row[[paste0("nClusters_", th)]] <- r$ecs_summary$nPolygon[j]
-      row[[paste0("ECS_pct_", th)]] <- r$ecs_summary$ECS_ha[j] / r$total_area_ha
-      row[[paste0("largest_cluster_share_", th)]] <- r$breakdown[[j]]$largest_cluster_share
-      row[[paste0("mean_cluster_size_ha_", th)]] <- r$breakdown[[j]]$mean_cluster_size_ha
-    }
-    row$goc_bypassed <- r$goc_bypassed
-    row$error <- NA
-    row
-  }, error = function(e) {
-    row <- as.data.frame(setNames(as.list(rep(NA, length(row_names))), row_names))
-    row$region <- rn
-    row$area_ha <- area_ha
-    row$error <- conditionMessage(e)
-    row
-  })
-
-  elapsed <- round(as.numeric(Sys.time() - t0, units = "secs"), 1)
-  status <- if (is.na(res$error)) "ok" else paste("FAILED:", res$error)
-  cat(sprintf("[%d/%d] %s (%.1f ha) — %.1fs — %s\n", i, length(remaining), rn, area_ha, elapsed, status))
-
-  # Append-and-rewrite: safe against interruption at any point, and cheap
-  # at this number of rows and columns.
-  combined <- if (is.null(prior)) res else bind_rows(prior, res)
-  prior <- combined
-  write.csv(combined, results_path, row.names = FALSE)
-}
-
-cat("\n=== NATIONAL RUN COMPLETE ===\n")
-cat("Total regions:", nrow(prior), " — failures:", sum(!is.na(prior$error)), "\n")
-```
-
-## Repair of GOC() silent-failure regions in the checkpoint
-
-`build_region_mpg()` above catches GOC() returning internally impossible
-cluster areas (the consistency check in the ECS branch), so new runs of
-`national_loop` correct themselves. `national_loop` is resumable and
-skips any region already in `08_national_ecs_results.csv`, so rows
-computed before that check existed would keep their bad values. This
-chunk finds those rows using the same invariant (ECS_pct can never be
-less than largest_cluster_share^2, at any threshold) and removes them, so
-that `national_loop` recomputes them the next time it runs. When nothing
-is broken it finds and removes 0 regions, so it is safe to re-run.
-
-```{r national_loop_goc_consistency_fix}
-prior <- read.csv(results_path, stringsAsFactors = FALSE)
-tol <- 0.01
-
-find_violations <- function(df, pct_col, share_col) {
-  sub <- df |> filter(!is.na(.data[[pct_col]]), !is.na(.data[[share_col]]))
-  sub$region[sub[[pct_col]] < (sub[[share_col]]^2 - tol)]
-}
-bad_regions <- unique(c(
-  find_violations(prior, "ECS_pct_59", "largest_cluster_share_59"),
-  find_violations(prior, "ECS_pct_99", "largest_cluster_share_99"),
-  find_violations(prior, "ECS_pct_512", "largest_cluster_share_512")
-))
-cat("Regions with an internally-inconsistent ECS value:", length(bad_regions), "\n")
-
-if (length(bad_regions) > 0) {
-  file.copy(results_path, sub("\\.csv$", "_BACKUP_before_goc_fix.csv", results_path), overwrite = FALSE)
-  prior <- prior |> filter(!(region %in% bad_regions))
-  write.csv(prior, results_path, row.names = FALSE)
-  cat("Removed from checkpoint; re-run the national_loop chunk above to recompute them",
-      "with the now-fixed build_region_mpg().\n")
-}
 ```
 
 # Threshold sweep: connectivity at every 10 m threshold, separate from the national loop above
@@ -1153,18 +1169,6 @@ richness.
 library(ggplot2)
 if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel", repos = "https://cloud.r-project.org")
 library(ggrepel)
-
-# Figures are written here as well as shown in the plot pane. The folder
-# is in the project, not on the checkpoint drive, because these are small
-# outputs that belong with the manuscript.
-figures_dir <- here::here("figures")
-dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
-
-save_fig <- function(plot_obj, name, width = 9, height = 6.5) {
-  ggsave(file.path(figures_dir, paste0(name, ".png")),
-         plot_obj, width = width, height = height, dpi = 300)
-  invisible(plot_obj)
-}
 
 # Defined here as well as in the national_loop chunk, so the analysis and
 # figure chunks below can be run without re-running the national build.
